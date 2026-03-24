@@ -5,7 +5,7 @@ from google.genai import types
 
 # --- Config ---
 API_KEY = "REDACTED_GOOGLE_API_KEY"
-MODEL = "gemini-2.5-flash-image"
+MODEL = "gemini-3.1-flash-image-preview"
 GEN_DIR = "generated"
 os.makedirs(GEN_DIR, exist_ok=True)
 
@@ -218,24 +218,29 @@ async def post_generate(request):
             return Div(*parts_html, cls="result-card") if parts_html else Div("No output generated.", cls="error")
 
         else:
-            # Text-only → use Imagen 4 for best quality
-            response = client.models.generate_images(
-                model="imagen-4.0-generate-001",
-                prompt=prompt,
-                config=types.GenerateImagesConfig(number_of_images=1)
+            # Text-only generation via Gemini 3.1 Flash Image
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=["TEXT", "IMAGE"]
+                )
             )
 
-            if response.generated_images:
-                fname = f"{uuid.uuid4().hex}.png"
-                fpath = os.path.join(GEN_DIR, fname)
-                with open(fpath, 'wb') as f:
-                    f.write(response.generated_images[0].image.image_bytes)
-                return Div(
-                    Img(src=f"/generated/{fname}", alt="Generated image"),
-                    cls="result-card"
-                )
-            else:
-                return Div("No image was generated. Try a different prompt.", cls="error")
+            parts_html = []
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    fname = f"{uuid.uuid4().hex}.png"
+                    fpath = os.path.join(GEN_DIR, fname)
+                    with open(fpath, 'wb') as f:
+                        f.write(part.inline_data.data)
+                    parts_html.append(
+                        Img(src=f"/generated/{fname}", alt="Generated image")
+                    )
+                if hasattr(part, 'text') and part.text:
+                    parts_html.append(Div(part.text, cls="result-text"))
+
+            return Div(*parts_html, cls="result-card") if parts_html else Div("No image was generated. Try a different prompt.", cls="error")
 
     except Exception as e:
         traceback.print_exc()
