@@ -49,6 +49,12 @@ textarea::placeholder { color: var(--lg); }
 .err { margin-top: 14px; padding: 10px 12px; border-radius: 6px; background: #fef2f2; color: #b91c1c; font-size: 13px; }
 .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: r .5s linear infinite; vertical-align: middle; margin-right: 6px; }
 @keyframes r { to { transform: rotate(360deg); } }
+.meta { font-size: 11px; color: var(--lg); margin-top: 8px; line-height: 1.6; }
+.meta span { margin-right: 10px; }
+.think { margin-top: 8px; }
+.think summary { font-size: 11px; color: var(--lg); cursor: pointer; }
+.think summary:hover { color: var(--mg); }
+.think pre { font-size: 12px; color: var(--mg); line-height: 1.5; white-space: pre-wrap; margin-top: 4px; font-family: inherit; }
 """
 
 JS = """\
@@ -206,7 +212,12 @@ async def post_generate(request):
         response = chat.send_message(contents)
 
         parts = []
+        # Collect thinking text
+        think_text = ""
         for part in response.candidates[0].content.parts:
+            if getattr(part, 'thought', False) and part.text:
+                think_text += part.text
+                continue
             if hasattr(part, 'inline_data') and part.inline_data:
                 fname = f"{uuid.uuid4().hex}.png"
                 with open(os.path.join(GEN_DIR, fname), 'wb') as f:
@@ -214,6 +225,38 @@ async def post_generate(request):
                 parts.append(Img(src=f"/generated/{fname}", alt="result"))
             if hasattr(part, 'text') and part.text:
                 parts.append(P(part.text))
+
+        # Thinking block
+        if think_text:
+            parts.append(Details(
+                Summary("\u601d\u7ef4\u8fc7\u7a0b"),
+                Pre(think_text),
+                cls="think"
+            ))
+
+        # Usage & cost
+        um = getattr(response, 'usage_metadata', None)
+        if um:
+            inp_t = um.prompt_token_count or 0
+            out_t = um.candidates_token_count or 0
+            think_t = um.thoughts_token_count or 0
+            # Separate image tokens from text tokens in output
+            img_t = 0
+            for d in (um.candidates_tokens_details or []):
+                if d.modality and d.modality.value == 'IMAGE':
+                    img_t = d.token_count or 0
+            txt_out_t = out_t - img_t
+            # Pricing: input $0.50/1M, output text+thinking $3/1M, output image $60/1M
+            cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
+            meta_parts = [
+                Span(f"\u8f93\u5165 {inp_t}"),
+                Span(f"\u8f93\u51fa {out_t}"),
+            ]
+            if think_t:
+                meta_parts.append(Span(f"\u601d\u7ef4 {think_t}"))
+            meta_parts.append(Span(f"\u5408\u8ba1 {um.total_token_count or 0} tokens"))
+            meta_parts.append(Span(f"${cost:.4f}"))
+            parts.append(Div(*meta_parts, cls="meta"))
 
         if parts:
             return Div(*parts)
