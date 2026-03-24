@@ -52,6 +52,11 @@ def build_context(sid: str) -> dict:
 
 
 EXTRA_CSS = """\
+/* ── Mobile responsive ── */
+@media(max-width:480px){
+  #key-status { display:none; }
+  .uk-container { padding-left:12px !important; padding-right:12px !important; }
+}
 /* ── Global border-radius override (8px for all UIkit components) ── */
 .uk-card, .uk-modal-dialog, .uk-textarea, .uk-input, .uk-select { border-radius:8px !important; }
 .uk-btn { border-radius:8px !important; }
@@ -323,15 +328,18 @@ def key_modal():
 
 
 def page_header(title, *extra_buttons):
-    return DivFullySpaced(
-        H3(title, cls="font-bold"),
-        DivHStacked(
-            Span(id="key-status", cls="text-xs text-muted-foreground mr-1"),
-            Button(UkIcon('key', height=16), cls=ButtonT.ghost,
-                   onclick="toggleKeyModal()", title="\u8bbe\u7f6e API Key"),
-            *extra_buttons,
+    return Div(
+        Div(
+            H3(title, cls="font-bold text-lg sm:text-xl whitespace-nowrap"),
+            Div(
+                Span(id="key-status", cls="text-xs text-muted-foreground"),
+                Button(UkIcon('key', height=16), cls=ButtonT.ghost,
+                       onclick="toggleKeyModal()", title="\u8bbe\u7f6e API Key"),
+                *extra_buttons,
+                cls="flex items-center gap-1 flex-shrink-0",
+            ),
+            cls="flex items-center justify-between gap-2 py-3",
         ),
-        cls="py-3",
     )
 
 
@@ -340,8 +348,8 @@ def get():
     return Container(
         page_header(
             "\u56fe\u7247\u5de5\u4f5c\u53f0",
-            A("\u6279\u91cf", href="/batch", cls="uk-btn uk-btn-default uk-btn-sm"),
-            Button("\u65b0\u5bf9\u8bdd", cls=(ButtonT.default, ButtonT.sm), onclick="newChat()"),
+            A("\u6279\u91cf", href="/batch", cls="uk-btn uk-btn-default uk-btn-sm whitespace-nowrap"),
+            Button("\u65b0\u5bf9\u8bdd", cls=(ButtonT.default, ButtonT.sm, 'whitespace-nowrap'), onclick="newChat()"),
         ),
         Card(
             Div(Div("\u65b0\u5bf9\u8bdd", cls="ctx-empty"), id="ctx-list"),
@@ -845,7 +853,7 @@ def get_batch():
     return Container(
         page_header(
             "\u6279\u91cf\u5904\u7406",
-            A("\u2190 \u5355\u5f20\u6a21\u5f0f", href="/", cls="uk-btn uk-btn-default uk-btn-sm"),
+            A("\u2190 \u5355\u5f20", href="/", cls="uk-btn uk-btn-default uk-btn-sm whitespace-nowrap"),
         ),
         Card(
             Textarea(id="b-prompt",
