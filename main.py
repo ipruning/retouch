@@ -52,16 +52,24 @@ def build_context(sid: str) -> dict:
 
 
 EXTRA_CSS = """\
+/* ── Global border-radius override (8px for all UIkit components) ── */
+.uk-card, .uk-modal-dialog, .uk-textarea, .uk-input, .uk-select { border-radius:8px !important; }
+.uk-btn { border-radius:8px !important; }
+.uk-card-header:first-child { border-radius:8px 8px 0 0; }
+.uk-card-footer:last-child { border-radius:0 0 8px 8px; }
+/* ── Button loading state alignment ── */
+.btn-loading { display:inline-flex !important; align-items:center; gap:6px; }
+
 .ctx-turn { display:flex; gap:6px; align-items:center; padding:4px 0; font-size:13px; }
 .ctx-role { font-weight:600; white-space:nowrap; color:var(--color-muted-foreground); }
 .ctx-parts { display:flex; flex-wrap:wrap; gap:4px; align-items:center; }
 .ctx-text { color:var(--color-muted-foreground); max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.ctx-thumb { width:28px; height:28px; border-radius:4px; object-fit:cover; }
+.ctx-thumb { width:28px; height:28px; border-radius:8px; object-fit:cover; }
 .ctx-img-label { font-size:11px; color:var(--color-muted-foreground); }
 .ctx-empty { color:var(--color-muted-foreground); font-size:13px; padding:4px 0; }
 .upload-preview { display:flex; align-items:center; gap:8px; padding:8px 0; }
 .upload-preview.hide { display:none; }
-.upload-preview img { width:48px; height:48px; border-radius:6px; object-fit:cover; }
+.upload-preview img { width:48px; height:48px; border-radius:8px; object-fit:cover; }
 .upload-name { font-size:12px; color:var(--color-muted-foreground); }
 .upload-x { background:none; border:none; cursor:pointer; font-size:16px; color:var(--color-muted-foreground); }
 .result { margin-top:16px; line-height:1.6; }
@@ -86,7 +94,7 @@ EXTRA_CSS = """\
 .b-spin { width:22px; height:22px; border:3px solid rgba(255,255,255,.4);
   border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
-.b-drop { border:2px dashed var(--color-border); border-radius:12px; padding:32px;
+.b-drop { border:2px dashed var(--color-border); border-radius:8px; padding:32px;
   text-align:center; cursor:pointer; transition:border-color .2s; }
 .b-drop.over { border-color:hsl(var(--primary)); background:hsl(var(--primary)/.05); }
 .b-drop input[type=file] { display:none; }
@@ -225,7 +233,7 @@ async function go(){
   const fi=document.getElementById('file');
   if(pastedFile)fd.append('image',pastedFile,'pasted.png');
   else if(fi&&fi.files[0])fd.append('image',fi.files[0]);
-  btn.disabled=true;btn.innerHTML='<span uk-spinner="ratio:0.6"></span> \u751f\u6210\u4e2d\u2026';
+  btn.disabled=true;btn.classList.add('btn-loading');btn.innerHTML='<span uk-spinner="ratio:0.6"></span> \u751f\u6210\u4e2d\u2026';
   // Prepare result area
   const ra=document.getElementById('result-area');
   ra.innerHTML='<div class="result" id="cur-result"><span class="cursor-blink"></span></div>';
@@ -281,7 +289,7 @@ async function go(){
     const res=document.getElementById('cur-result');
     if(res)res.innerHTML='<div class="err">'+e.message+'</div>';
   }
-  finally{btn.disabled=false;btn.textContent='\u751f\u6210';}
+  finally{btn.disabled=false;btn.classList.remove('btn-loading');btn.textContent='\u751f\u6210';}
 }
 document.getElementById('prompt').addEventListener('keydown',function(e){
   if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();go();}
@@ -356,7 +364,7 @@ def get():
                               onchange="onFile(this)", cls="hidden"),
                         cls="cursor-pointer text-sm text-muted-foreground flex items-center gap-1",
                     ),
-                    Button("\u751f\u6210", id="btn", cls=(ButtonT.primary, 'px-12'),
+                    Button("\u751f\u6210", id="btn", cls=(ButtonT.primary, 'min-w-[120px] justify-center'),
                            onclick="go()"),
                 ),
                 Div(id="env-footer", cls="text-xs text-muted-foreground mt-2"),
@@ -706,14 +714,14 @@ async function startBatch(){
   if(!prompt){alert('请输入提示词');return;}
   if(bFiles.length===0){alert('请上传图片');return;}
   const btn=document.getElementById('b-start');
-  btn.disabled=true; btn.innerHTML='<span uk-spinner="ratio:0.6"></span> 上传中…';
+  btn.disabled=true; btn.classList.add('btn-loading'); btn.innerHTML='<span uk-spinner="ratio:0.6"></span> 上传中…';
   const fd=new FormData();
   fd.append('prompt',prompt);
   bFiles.forEach(function(bf){fd.append('images',bf.file);});
   try{
     const r=await fetch('/batch/start',{method:'POST',body:fd});
     const j=await r.json();
-    if(j.error){alert(j.error);btn.disabled=false;btn.textContent='开始处理';return;}
+    if(j.error){alert(j.error);btn.disabled=false;btn.classList.remove('btn-loading');btn.textContent='开始处理';return;}
     batchId=j.batch_id;
     bStarted=true;
     document.getElementById('b-drop').style.display='none';
@@ -725,7 +733,7 @@ async function startBatch(){
     startPoll();
   }catch(e){
     alert('上传失败: '+e.message);
-    btn.disabled=false; btn.textContent='开始处理';
+    btn.disabled=false; btn.classList.remove('btn-loading'); btn.textContent='开始处理';
   }
 }
 
@@ -857,7 +865,7 @@ def get_batch():
         Div(
             DivFullySpaced(
                 Span(id="b-estimate", cls="text-sm text-muted-foreground"),
-                Button("\u5f00\u59cb\u5904\u7406", id="b-start", cls=ButtonT.primary,
+                Button("\u5f00\u59cb\u5904\u7406", id="b-start", cls=(ButtonT.primary, 'min-w-[120px] justify-center'),
                        onclick="startBatch()"),
             ),
             id="b-controls", style="display:none",
