@@ -1,4 +1,4 @@
-import uuid, os, traceback, json, threading
+import uuid, os, traceback, json, hashlib
 from fasthtml.common import *
 from google import genai
 from google.genai import types
@@ -11,142 +11,202 @@ os.makedirs(GEN_DIR, exist_ok=True)
 
 gclient = genai.Client(api_key=API_KEY)
 sessions: dict = {}
-# Store pending tasks: task_id -> {contents, sid}
-pending: dict = {}
+
+
+def save_image(data: bytes) -> str:
+    """Save image bytes, deduplicate by content hash, return URL path."""
+    h = hashlib.md5(data).hexdigest()
+    fname = f"{h}.jpg"
+    fpath = os.path.join(GEN_DIR, fname)
+    if not os.path.exists(fpath):
+        with open(fpath, 'wb') as f:
+            f.write(data)
+    return f"/generated/{fname}"
+
+
+def build_context(sid: str) -> dict:
+    """Build context structure from chat history for UI display."""
+    if sid not in sessions:
+        return {"turns": [], "total_bytes": 0}
+    chat = sessions[sid]
+    history = chat.get_history(curated=True)
+    turns = []
+    total_bytes = 0
+    for content in history:
+        role = content.role or "?"
+        parts_desc = []
+        for p in (content.parts or []):
+            if hasattr(p, 'inline_data') and p.inline_data and p.inline_data.data:
+                size = len(p.inline_data.data)
+                total_bytes += size
+                url = save_image(p.inline_data.data)
+                parts_desc.append({"type": "image", "size": size, "url": url})
+            elif hasattr(p, 'text') and p.text and not getattr(p, 'thought', False):
+                t = p.text
+                preview = (t[:40] + "\u2026") if len(t) > 40 else t
+                parts_desc.append({"type": "text", "value": preview})
+        if parts_desc:
+            turns.append({"role": "\u4f60" if role == "user" else "\u6a21\u578b", "parts": parts_desc})
+    return {"turns": turns, "total_bytes": total_bytes}
+
 
 CSS = """\
 * { box-sizing: border-box; margin: 0; padding: 0; }
 :root { --fg: #111; --mg: #555; --lg: #aaa; --bg: #fff; --bd: #e0e0e0; }
-body { font-family: "PingFang SC", -apple-system, "Helvetica Neue", "Noto Sans SC", sans-serif; background: var(--bg); color: var(--fg); height: 100vh; overflow: hidden; }
+body { font-family: "PingFang SC", -apple-system, "Helvetica Neue", "Noto Sans SC", sans-serif;
+       background: var(--bg); color: var(--fg); height: 100vh; overflow: hidden; }
 .w { max-width: 520px; margin: 0 auto; display: flex; flex-direction: column; height: 100vh; }
-.head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; flex-shrink: 0; }
+.head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 12px; flex-shrink: 0; }
 .head h1 { font-size: 16px; font-weight: 600; }
 .nb { font-size: 12px; color: var(--lg); cursor: pointer; border: 1px solid var(--bd); border-radius: 4px; padding: 3px 8px; background: none; }
 .nb:hover { color: var(--fg); border-color: var(--fg); }
-.tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--bd); padding: 0 20px; flex-shrink: 0; }
-.tab { padding: 6px 0; font-size: 13px; color: var(--lg); cursor: pointer; border-bottom: 1.5px solid transparent; margin-bottom: -1px; }
-.tab:hover { color: var(--mg); }
-.tab.on { color: var(--fg); border-bottom-color: var(--fg); }
-.field { margin-bottom: 14px; }
-textarea { width: 100%; min-height: 56px; padding: 10px 12px; border: 1px solid var(--bd); border-radius: 6px; font-size: 14px; font-family: inherit; color: var(--fg); background: var(--bg); resize: vertical; outline: none; }
-textarea:focus { border-color: #999; }
-textarea::placeholder { color: var(--lg); }
-.drop { border: 1.5px dashed var(--bd); border-radius: 6px; padding: 14px; text-align: center; cursor: pointer; position: relative; color: var(--lg); font-size: 13px; margin-bottom: 14px; }
-.drop:hover { border-color: #999; }
-.drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
-.drop .name { color: var(--fg); }
-.drop.has-img { border-style: solid; border-color: #999; }
-.thumb { margin-bottom: 14px; }
-.thumb img { max-width: 56px; max-height: 56px; border-radius: 4px; }
-.btn { display: block; width: 100%; padding: 10px; background: var(--fg); color: #fff; border: none; border-radius: 6px; font-size: 14px; font-weight: 500; cursor: pointer; font-family: inherit; }
+
+/* Main scrollable area */
+.main { flex: 1; overflow-y: auto; padding: 0 20px 24px; }
+
+/* Envelope */
+.envelope { border: 1.5px solid var(--bd); border-radius: 10px; padding: 0; overflow: hidden; }
+.env-head { font-size: 11px; color: var(--lg); padding: 10px 14px 0; }
+.ctx-list { padding: 6px 14px 0; }
+.ctx-empty { font-size: 13px; color: var(--lg); padding: 4px 0; }
+.ctx-turn { display: flex; gap: 8px; padding: 3px 0; font-size: 13px; line-height: 1.6; align-items: center; }
+.ctx-role { color: var(--mg); font-weight: 500; flex-shrink: 0; min-width: 26px; }
+.ctx-parts { color: var(--lg); display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ctx-parts .ctx-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ctx-thumb { width: 28px; height: 28px; border-radius: 3px; object-fit: cover; flex-shrink: 0; }
+.ctx-img-label { white-space: nowrap; }
+.ctx-sep { border-top: 1.5px dashed var(--bd); margin: 8px 14px 0; }
+
+/* Upload preview inside envelope */
+.upload-preview { display: flex; align-items: center; gap: 8px; padding: 8px 14px 0; }
+.upload-preview img { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; }
+.upload-preview .upload-name { font-size: 12px; color: var(--mg); }
+.upload-preview .upload-x { background: none; border: none; color: var(--lg); font-size: 16px; cursor: pointer; padding: 0 4px; }
+.upload-preview .upload-x:hover { color: var(--fg); }
+.hide { display: none; }
+
+/* Input inside envelope */
+.env-input { padding: 8px 14px; }
+.env-input textarea { width: 100%; min-height: 48px; padding: 8px 10px; border: 1px solid var(--bd); border-radius: 6px;
+                       font-size: 14px; font-family: inherit; color: var(--fg); background: var(--bg);
+                       resize: vertical; outline: none; }
+.env-input textarea:focus { border-color: #999; }
+.env-input textarea::placeholder { color: var(--lg); }
+.env-actions { display: flex; gap: 8px; padding: 0 14px 10px; align-items: center; }
+.env-actions .attach { font-size: 12px; color: var(--lg); cursor: pointer; position: relative; }
+.env-actions .attach:hover { color: var(--mg); }
+.env-actions .attach input { position: absolute; inset: 0; opacity: 0; width: 100%; cursor: pointer; }
+.btn { flex: 1; padding: 9px; background: var(--fg); color: #fff; border: none; border-radius: 6px;
+       font-size: 14px; font-weight: 500; cursor: pointer; font-family: inherit; }
 .btn:hover { opacity: .85; }
 .btn:disabled { opacity: .4; cursor: default; }
-.hide { display: none; }
-.history { flex: 1; overflow-y: auto; padding: 20px 20px 10px; }
-.turn { margin-bottom: 14px; }
-.turn .role { font-size: 11px; color: var(--lg); margin-bottom: 3px; }
-.turn .bubble { font-size: 14px; line-height: 1.6; color: var(--mg); }
-.turn img { width: 100%; border-radius: 6px; display: block; margin-top: 6px; }
-.turn .user-text { color: var(--fg); }
-.divider { height: 1px; background: var(--bd); margin: 18px 0; }
-.err { margin-top: 14px; padding: 10px 12px; border-radius: 6px; background: #fef2f2; color: #b91c1c; font-size: 13px; }
-.input-area { flex-shrink: 0; padding: 10px 20px 20px; border-top: 1px solid var(--bd); background: var(--bg); }
-.spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: r .5s linear infinite; vertical-align: middle; margin-right: 6px; }
-@keyframes r { to { transform: rotate(360deg); } }
+.env-footer { font-size: 11px; color: var(--lg); padding: 0 14px 10px; line-height: 1.4; }
+
+/* Result area */
+.result-area { margin-top: 16px; }
+.result { margin-bottom: 16px; }
+.result img { width: 100%; border-radius: 8px; display: block; margin-top: 4px; }
+.result-text { font-size: 14px; line-height: 1.6; color: var(--mg); margin-bottom: 4px; }
 .meta { font-size: 11px; color: var(--lg); margin-top: 8px; line-height: 1.6; }
 .meta span { margin-right: 10px; }
-.ctx { font-size: 11px; color: var(--lg); text-align: center; padding: 4px 0; margin-bottom: 10px; }
-.ctx-detail { font-size: 11px; color: var(--lg); background: #f9f9f9; border-radius: 6px; padding: 8px 12px; margin-bottom: 14px; line-height: 1.8; }
-.ctx-detail .ctx-turn { display: flex; align-items: baseline; gap: 6px; }
-.ctx-detail .ctx-role { color: var(--mg); font-weight: 500; min-width: 28px; }
-.ctx-detail .ctx-parts { color: var(--lg); }
-.think { margin-top: 8px; }
-.think summary { font-size: 11px; color: var(--lg); cursor: pointer; }
-.think summary:hover { color: var(--mg); }
-.think pre { font-size: 12px; color: var(--mg); line-height: 1.5; white-space: pre-wrap; margin-top: 4px; font-family: inherit; }
+.err { padding: 10px 12px; border-radius: 6px; background: #fef2f2; color: #b91c1c; font-size: 13px; }
+.spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.3);
+        border-top-color: #fff; border-radius: 50%; animation: r .5s linear infinite;
+        vertical-align: middle; margin-right: 6px; }
+@keyframes r { to { transform: rotate(360deg); } }
 .streaming-text { display: inline; }
-.cursor-blink { display: inline-block; width: 2px; height: 14px; background: var(--fg); margin-left: 2px; vertical-align: text-bottom; animation: blink 0.8s step-end infinite; }
+.cursor-blink { display: inline-block; width: 2px; height: 14px; background: var(--fg);
+                margin-left: 2px; vertical-align: text-bottom; animation: blink .8s step-end infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 """
 
 JS = """\
-let mode='gen',sid=localStorage.getItem('sid')||'',pastedFile=null;
+let sid=localStorage.getItem('sid')||'',pastedFile=null;
 if(!sid){sid=crypto.randomUUID();localStorage.setItem('sid',sid);}
-function sw(m){
-  mode=m;
-  document.getElementById('t-gen').classList.toggle('on',m==='gen');
-  document.getElementById('t-edit').classList.toggle('on',m==='edit');
-  document.getElementById('upload').className=m==='edit'?'field':'hide';
-  document.getElementById('btn').textContent=m==='gen'?'\u751f\u6210':'\u7f16\u8f91';
+
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function scrollM(){const m=document.getElementById('main');m.scrollTop=m.scrollHeight;}
+
+function renderCtx(ctx){
+  const el=document.getElementById('ctx-list');
+  const ft=document.getElementById('env-footer');
+  if(!ctx||!ctx.turns||ctx.turns.length===0){
+    el.innerHTML='<div class="ctx-empty">\u65b0\u5bf9\u8bdd</div>';
+    ft.textContent='';return;
+  }
+  let h='';
+  ctx.turns.forEach(function(t){
+    h+='<div class="ctx-turn"><span class="ctx-role">'+t.role+'</span><span class="ctx-parts">';
+    t.parts.forEach(function(p){
+      if(p.type==='text')h+='<span class="ctx-text">'+esc(p.value)+'</span>';
+      else if(p.type==='image'){
+        if(p.url)h+='<img class="ctx-thumb" src="'+p.url+'">';
+        h+='<span class="ctx-img-label">'+Math.round(p.size/1024)+'KB</span>';
+      }
+    });
+    h+='</span></div>';
+  });
+  el.innerHTML=h;
+  if(ctx.total_bytes>0){
+    ft.textContent='\u2191 \u4ee5\u4e0a '+ctx.turns.length+' \u8f6e\u5c06\u968f\u65b0\u6d88\u606f\u53d1\u9001\u7ed9\u6a21\u578b \u00b7 '+(ctx.total_bytes/1024/1024).toFixed(1)+'MB';
+  }else{ft.textContent='';}
 }
-function showPreview(file,label){
-  const t=document.getElementById('thumb');t.innerHTML='';
-  const d=document.getElementById('dropzone');
-  d.innerHTML='<span class="name">'+label+'</span>';
-  const inp=document.createElement('input');
-  inp.type='file';inp.id='file';inp.accept='image/*';
-  inp.onchange=function(){pastedFile=null;pv(this);};
-  d.appendChild(inp);d.classList.add('has-img');
-  const img=document.createElement('img');
-  const r=new FileReader();r.onload=e=>{img.src=e.target.result;t.appendChild(img);};r.readAsDataURL(file);
+
+function showUpload(file,label){
+  const box=document.getElementById('upload-preview');
+  box.classList.remove('hide');
+  const img=box.querySelector('img');
+  const nm=box.querySelector('.upload-name');
+  nm.textContent=label;
+  const r=new FileReader();r.onload=function(e){img.src=e.target.result;};r.readAsDataURL(file);
 }
-function pv(el){pastedFile=null;if(el.files[0])showPreview(el.files[0],el.files[0].name);}
 function clearImage(){
   pastedFile=null;
-  document.getElementById('thumb').innerHTML='';
-  const d=document.getElementById('dropzone');d.classList.remove('has-img');
-  d.innerHTML='\u70b9\u51fb\u4e0a\u4f20\u6216\u7c98\u8d34\u56fe\u7247';
-  const inp=document.createElement('input');
-  inp.type='file';inp.id='file';inp.accept='image/*';
-  inp.onchange=function(){pastedFile=null;pv(this);};
-  d.appendChild(inp);
+  const box=document.getElementById('upload-preview');
+  box.classList.add('hide');
+  const fi=document.getElementById('file');if(fi)fi.value='';
 }
+function onFile(el){pastedFile=null;if(el.files[0])showUpload(el.files[0],el.files[0].name);}
+
 function newChat(){
   sid=crypto.randomUUID();localStorage.setItem('sid',sid);
-  document.getElementById('history').innerHTML='';
+  renderCtx(null);
+  document.getElementById('result-area').innerHTML='';
   document.getElementById('prompt').value='';clearImage();
 }
+
 document.addEventListener('paste',function(e){
   const items=e.clipboardData&&e.clipboardData.items;if(!items)return;
   for(let i=0;i<items.length;i++){
     if(items[i].type.indexOf('image')!==-1){
       e.preventDefault();const blob=items[i].getAsFile();if(!blob)return;
-      pastedFile=blob;sw('edit');showPreview(blob,'\u5df2\u7c98\u8d34');return;
+      pastedFile=blob;showUpload(blob,'\u5df2\u7c98\u8d34');return;
     }
   }
 });
-function scrollH(){const h=document.getElementById('history');h.scrollTop=h.scrollHeight;}
+
 async function go(){
   const btn=document.getElementById('btn'),p=document.getElementById('prompt').value.trim();
   if(!p)return;
-  const fd=new FormData();fd.append('prompt',p);fd.append('mode',mode);fd.append('sid',sid);
-  const f=document.getElementById('file');
-  if(mode==='edit'){
-    if(pastedFile)fd.append('image',pastedFile,'pasted.png');
-    else if(f&&f.files[0])fd.append('image',f.files[0]);
-  }
+  const fd=new FormData();fd.append('prompt',p);fd.append('sid',sid);
+  const fi=document.getElementById('file');
+  if(pastedFile)fd.append('image',pastedFile,'pasted.png');
+  else if(fi&&fi.files[0])fd.append('image',fi.files[0]);
   btn.disabled=true;btn.innerHTML='<span class="spin"></span>\u751f\u6210\u4e2d\u2026';
-  // Add user turn
-  const h=document.getElementById('history');
-  const ut=document.createElement('div');ut.className='turn';
-  ut.innerHTML='<div class="role">\u4f60</div><div class="bubble user-text">'+p.replace(/</g,'&lt;')+'</div>';
-  h.appendChild(ut);
-  // Add model turn (will be filled by stream)
-  const mt=document.createElement('div');mt.className='turn';
-  mt.innerHTML='<div class="role">\u6a21\u578b</div><div class="bubble" id="stream-bubble"><span class="cursor-blink"></span></div>';
-  h.appendChild(mt);
-  scrollH();
+  // Prepare result area
+  const ra=document.getElementById('result-area');
+  ra.innerHTML='<div class="result" id="cur-result"><span class="cursor-blink"></span></div>';
+  scrollM();
   try{
     const r=await fetch('/generate',{method:'POST',body:fd});
     const reader=r.body.getReader();
     const decoder=new TextDecoder();
     let buf='';
-    const bubble=document.getElementById('stream-bubble');
+    const res=document.getElementById('cur-result');
     while(true){
       const {done,value}=await reader.read();
       if(done)break;
       buf+=decoder.decode(value,{stream:true});
-      // Parse SSE lines
       let lines=buf.split(String.fromCharCode(10));
       buf=lines.pop();
       for(const line of lines){
@@ -156,67 +216,39 @@ async function go(){
         let ev;
         try{ev=JSON.parse(raw);}catch(e){continue;}
         if(ev.type==='text'){
-          // Remove cursor, append text, re-add cursor
-          const cur=bubble.querySelector('.cursor-blink');
+          const cur=res.querySelector('.cursor-blink');
           const span=document.createElement('span');
           span.className='streaming-text';
           span.textContent=ev.data;
-          if(cur)bubble.insertBefore(span,cur);
-          else bubble.appendChild(span);
-          scrollH();
+          if(cur)res.insertBefore(span,cur);else res.appendChild(span);
+          scrollM();
         }else if(ev.type==='image'){
-          const cur=bubble.querySelector('.cursor-blink');
+          const cur=res.querySelector('.cursor-blink');
           const img=document.createElement('img');
-          img.src=ev.data;
-          img.alt='result';
-          if(cur)bubble.insertBefore(img,cur);
-          else bubble.appendChild(img);
-          scrollH();
+          img.src=ev.data;img.alt='result';
+          if(cur)res.insertBefore(img,cur);else res.appendChild(img);
+          scrollM();
         }else if(ev.type==='meta'){
-          const cur=bubble.querySelector('.cursor-blink');
-          if(cur)cur.remove();
-          const d=document.createElement('div');
-          d.className='meta';
-          d.innerHTML=ev.data;
-          bubble.appendChild(d);
+          const cur=res.querySelector('.cursor-blink');if(cur)cur.remove();
+          const d=document.createElement('div');d.className='meta';d.innerHTML=ev.data;
+          res.appendChild(d);
         }else if(ev.type==='context'){
-          const cur=bubble.querySelector('.cursor-blink');
-          if(cur)cur.remove();
-          try{
-            const ctx=JSON.parse(ev.data);
-            let html='<div class="ctx-detail"><div style="margin-bottom:4px;color:#555">';
-            html+='\u4e0a\u4e0b\u6587 '+ctx.turns.length+'\u8f6e';
-            if(ctx.total_bytes>0)html+='\uff0c\u7ea6 '+(ctx.total_bytes/1024/1024).toFixed(1)+'MB \u56fe\u7247\u6570\u636e';
-            html+='</div>';
-            ctx.turns.forEach(function(t){
-              html+='<div class="ctx-turn"><span class="ctx-role">'+t.role+'</span><span class="ctx-parts">'+t.parts.join(' + ')+'</span></div>';
-            });
-            html+='</div>';
-            const d=document.createElement('div');
-            d.innerHTML=html;
-            bubble.appendChild(d.firstChild);
-          }catch(e){}
+          try{renderCtx(JSON.parse(ev.data));}catch(e){}
         }else if(ev.type==='error'){
-          const cur=bubble.querySelector('.cursor-blink');
-          if(cur)cur.remove();
-          bubble.innerHTML='<div class="err">'+ev.data+'</div>';
+          const cur=res.querySelector('.cursor-blink');if(cur)cur.remove();
+          res.innerHTML='<div class="err">'+ev.data+'</div>';
         }
       }
     }
-    // Remove cursor if still there
-    const cur=bubble.querySelector('.cursor-blink');
-    if(cur)cur.remove();
-    // Remove the temp id
-    bubble.removeAttribute('id');
-    // Add divider
-    const dv=document.createElement('div');dv.className='divider';h.appendChild(dv);
-    document.getElementById('prompt').value='';pastedFile=null;
-    scrollH();
+    const cur=res.querySelector('.cursor-blink');if(cur)cur.remove();
+    res.removeAttribute('id');
+    document.getElementById('prompt').value='';clearImage();
+    scrollM();
   }catch(e){
-    const bubble=document.getElementById('stream-bubble');
-    if(bubble)bubble.innerHTML='<div class="err">'+e.message+'</div>';
+    const res=document.getElementById('cur-result');
+    if(res)res.innerHTML='<div class="err">'+e.message+'</div>';
   }
-  finally{btn.disabled=false;btn.textContent=mode==='gen'?'\u751f\u6210':'\u7f16\u8f91';}
+  finally{btn.disabled=false;btn.textContent='\u751f\u6210';}
 }
 document.getElementById('prompt').addEventListener('keydown',function(e){
   if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();go();}
@@ -235,27 +267,42 @@ def get():
             cls="head"
         ),
         Div(
-            Div("\u751f\u6210", cls="tab on", id="t-gen", onclick="sw('gen')"),
-            Div("\u7f16\u8f91", cls="tab", id="t-edit", onclick="sw('edit')"),
-            cls="tabs"
-        ),
-        Div(id="history", cls="history"),
-        Div(
+            # The envelope
             Div(
+                Div("\u4e0a\u4e0b\u6587", cls="env-head"),
                 Div(
-                    "\u70b9\u51fb\u4e0a\u4f20\u6216\u7c98\u8d34\u56fe\u7247",
-                    Input(type="file", id="file", accept="image/*", onchange="pv(this)"),
-                    id="dropzone", cls="drop"
+                    Div("\u65b0\u5bf9\u8bdd", cls="ctx-empty"),
+                    id="ctx-list", cls="ctx-list"
                 ),
-                Div(id="thumb", cls="thumb"),
-                id="upload", cls="hide"
+                Div(cls="ctx-sep"),
+                # Upload preview (hidden by default)
+                Div(
+                    Img(src="", alt=""),
+                    Span(cls="upload-name"),
+                    Button("\u00d7", cls="upload-x", onclick="clearImage()"),
+                    id="upload-preview", cls="upload-preview hide"
+                ),
+                # Input
+                Div(
+                    Textarea(id="prompt", placeholder="\u63cf\u8ff0\u4f60\u60f3\u8981\u7684\u56fe\u7247\u2026"),
+                    cls="env-input"
+                ),
+                # Actions row: attach + submit
+                Div(
+                    Label(
+                        "\U0001f4ce \u4e0a\u4f20\u56fe\u7247",
+                        Input(type="file", id="file", accept="image/*", onchange="onFile(this)"),
+                        cls="attach"
+                    ),
+                    Button("\u751f\u6210", id="btn", cls="btn", onclick="go()"),
+                    cls="env-actions"
+                ),
+                Div(id="env-footer", cls="env-footer"),
+                cls="envelope"
             ),
-            Div(
-                Textarea(id="prompt", placeholder="\u63cf\u8ff0\u4f60\u60f3\u8981\u7684\u56fe\u7247\u2026"),
-                cls="field"
-            ),
-            Button("\u751f\u6210", id="btn", cls="btn", onclick="go()"),
-            cls="input-area"
+            # Result area
+            Div(id="result-area", cls="result-area"),
+            id="main", cls="main"
         ),
         Script(JS),
         cls="w"
@@ -277,7 +324,6 @@ def get_or_create_chat(sid: str):
 
 
 def sse_event(etype: str, data: str) -> str:
-    """Format a single SSE event."""
     return f"data: {json.dumps({'type': etype, 'data': data}, ensure_ascii=False)}\n\n"
 
 
@@ -285,33 +331,23 @@ def sse_event(etype: str, data: str) -> str:
 async def post_generate(request):
     form = await request.form()
     prompt = form.get("prompt", "").strip()
-    mode = form.get("mode", "gen")
     sid = form.get("sid", "")
     if not prompt:
-        return StreamingResponse(
-            iter([sse_event("error", "\u8bf7\u8f93\u5165\u63cf\u8ff0")]),
-            media_type="text/event-stream"
-        )
+        return StreamingResponse(iter([sse_event("error", "\u8bf7\u8f93\u5165\u63cf\u8ff0")]), media_type="text/event-stream")
     if not sid:
-        return StreamingResponse(
-            iter([sse_event("error", "\u7f3a\u5c11\u4f1a\u8bdd")]),
-            media_type="text/event-stream"
-        )
+        return StreamingResponse(iter([sse_event("error", "\u7f3a\u5c11\u4f1a\u8bdd")]), media_type="text/event-stream")
 
-    # Read upload if present
     img_bytes = None
     img_ct = None
-    if mode == "edit":
-        upload = form.get("image")
-        if upload and hasattr(upload, 'read'):
-            img_bytes = await upload.read()
-            img_ct = upload.content_type or "image/png"
+    upload = form.get("image")
+    if upload and hasattr(upload, 'read'):
+        img_bytes = await upload.read()
+        img_ct = upload.content_type or "image/png"
 
     def stream_gen():
         try:
             chat = get_or_create_chat(sid)
-
-            if mode == "edit" and img_bytes:
+            if img_bytes:
                 contents = [types.Part.from_bytes(data=img_bytes, mime_type=img_ct), prompt]
             else:
                 contents = prompt
@@ -323,23 +359,18 @@ async def post_generate(request):
                 cand = chunk.candidates[0]
                 if cand.content and cand.content.parts:
                     for part in cand.content.parts:
-                        # Skip thought parts
                         if getattr(part, 'thought', False):
                             continue
                         if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
-                            fname = f"{uuid.uuid4().hex}.png"
-                            fpath = os.path.join(GEN_DIR, fname)
-                            with open(fpath, 'wb') as f:
-                                f.write(part.inline_data.data)
-                            yield sse_event("image", f"/generated/{fname}")
+                            url = save_image(part.inline_data.data)
+                            yield sse_event("image", url)
                         elif hasattr(part, 'text') and part.text:
                             yield sse_event("text", part.text)
-                # Track usage from each chunk (last one with data wins)
                 um = getattr(chunk, 'usage_metadata', None)
                 if um and um.prompt_token_count:
                     last_usage = um
 
-            # Send usage/cost meta
+            # Meta
             if last_usage:
                 um = last_usage
                 inp_t = um.prompt_token_count or 0
@@ -358,27 +389,9 @@ async def post_generate(request):
                 parts.append(f'<span>${cost:.4f}</span>')
                 yield sse_event("meta", ''.join(parts))
 
-            # Send context info
-            history = chat.get_history(curated=True)
-            ctx_turns = []
-            ctx_bytes = 0
-            for content in history:
-                role = content.role or "?"
-                parts_desc = []
-                for p in (content.parts or []):
-                    if hasattr(p, 'inline_data') and p.inline_data and p.inline_data.data:
-                        size = len(p.inline_data.data)
-                        ctx_bytes += size
-                        parts_desc.append(f"\u56fe\u7247 {size//1024}KB")
-                    elif hasattr(p, 'text') and p.text and not getattr(p, 'thought', False):
-                        txt = p.text
-                        preview = (txt[:30] + "\u2026") if len(txt) > 30 else txt
-                        parts_desc.append(preview)
-                if parts_desc:
-                    ctx_turns.append({"role": "\u4f60" if role == "user" else "\u6a21\u578b", "parts": parts_desc})
-            ctx_data = json.dumps({"turns": ctx_turns, "total_bytes": ctx_bytes}, ensure_ascii=False)
-            yield sse_event("context", ctx_data)
-
+            # Context
+            ctx = build_context(sid)
+            yield sse_event("context", json.dumps(ctx, ensure_ascii=False))
             yield "data: [DONE]\n\n"
 
         except Exception as e:
@@ -386,37 +399,6 @@ async def post_generate(request):
             yield sse_event("error", f"\u9519\u8bef\uff1a{e}")
 
     return StreamingResponse(stream_gen(), media_type="text/event-stream")
-
-
-@rt("/context/{sid}")
-def get_context(sid: str):
-    """Return the current chat context structure for display."""
-    if sid not in sessions:
-        return Response(json.dumps({"turns": [], "total_bytes": 0}), media_type="application/json")
-    chat = sessions[sid]
-    history = chat.get_history(curated=True)
-    turns = []
-    total_bytes = 0
-    for content in history:
-        role = content.role or "?"
-        parts_desc = []
-        for p in (content.parts or []):
-            if hasattr(p, 'inline_data') and p.inline_data and p.inline_data.data:
-                size = len(p.inline_data.data)
-                total_bytes += size
-                parts_desc.append(f"\u56fe\u7247 {size//1024}KB")
-            elif hasattr(p, 'text') and p.text and not getattr(p, 'thought', False):
-                t = p.text
-                preview = (t[:40] + "\u2026") if len(t) > 40 else t
-                parts_desc.append(preview)
-            elif getattr(p, 'thought_signature', None):
-                total_bytes += len(p.thought_signature)
-        if parts_desc:
-            turns.append({"role": "\u4f60" if role == "user" else "\u6a21\u578b", "parts": parts_desc})
-    return Response(
-        json.dumps({"turns": turns, "total_bytes": total_bytes, "turn_count": len(turns)}, ensure_ascii=False),
-        media_type="application/json"
-    )
 
 
 @rt("/generated/{fname}")
