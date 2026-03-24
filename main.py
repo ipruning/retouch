@@ -1,4 +1,4 @@
-import uuid, os, traceback, json, hashlib, zipfile, io
+import uuid, os, traceback, json, hashlib, zipfile, io, threading, time
 from concurrent.futures import ThreadPoolExecutor
 from fasthtml.common import *
 from monsterui.all import *
@@ -519,8 +519,44 @@ def get_generated(fname: str):
 # BATCH MODE
 # ═══════════════════════════════════════════════════════════════════════════
 
-batch_pool = ThreadPoolExecutor(max_workers=3)
+# ── Batch concurrency infrastructure ──
+# Per-user semaphore: max 3 concurrent Gemini calls per user
+_USER_SEM_LIMIT = 3
+# Global cap: max 10 concurrent Gemini calls across all users
+_GLOBAL_SEM_LIMIT = 10
+# Max images per single batch request
+_BATCH_MAX_IMAGES = 50
+# Max pending batches per user
+_USER_MAX_BATCHES = 3
+# Auto-cleanup: remove finished batches after this many seconds
+_BATCH_TTL = 3600  # 1 hour
+
+batch_pool = ThreadPoolExecutor(max_workers=_GLOBAL_SEM_LIMIT)
+_global_sem = threading.Semaphore(_GLOBAL_SEM_LIMIT)
+_user_sems: dict[str, threading.Semaphore] = {}
+_user_sems_lock = threading.Lock()
 batches: dict = {}
+_batches_lock = threading.Lock()
+
+def _get_user_sem(uid: str) -> threading.Semaphore:
+    with _user_sems_lock:
+        if uid not in _user_sems:
+            _user_sems[uid] = threading.Semaphore(_USER_SEM_LIMIT)
+        return _user_sems[uid]
+
+def _user_active_batches(uid: str) -> int:
+    with _batches_lock:
+        return sum(1 for b in batches.values()
+                   if b.get("uid") == uid and not b.get("finished"))
+
+def _cleanup_old_batches():
+    """Remove batches older than _BATCH_TTL."""
+    now = time.time()
+    with _batches_lock:
+        to_del = [bid for bid, b in batches.items()
+                  if b.get("finished") and now - b["finished"] > _BATCH_TTL]
+        for bid in to_del:
+            del batches[bid]
 
 def _find_item(batch_id: str, item_id: str):
     batch = batches.get(batch_id)
@@ -535,11 +571,17 @@ def process_batch_item(batch_id: str, item_id: str):
     batch, item = _find_item(batch_id, item_id)
     if not item:
         return
-    client = get_client(batch.get("uid", ""))
+    uid = batch.get("uid", "")
+    client = get_client(uid)
     if not client:
         item["status"] = "failed"
         item["error"] = "API Key \u672a\u8bbe\u7f6e"
+        _maybe_finish_batch(batch_id)
         return
+    user_sem = _get_user_sem(uid)
+    # Acquire both semaphores: user-level then global
+    user_sem.acquire()
+    _global_sem.acquire()
     item["status"] = "running"
     try:
         with open(item["src_path"], "rb") as f:
@@ -587,15 +629,30 @@ def process_batch_item(batch_id: str, item_id: str):
         traceback.print_exc()
         item["status"] = "failed"
         item["error"] = str(e)[:300]
+    finally:
+        _global_sem.release()
+        user_sem.release()
+        _maybe_finish_batch(batch_id)
+
+def _maybe_finish_batch(batch_id: str):
+    """Mark batch as finished when all items are terminal, trigger cleanup."""
+    batch = batches.get(batch_id)
+    if not batch or batch.get("finished"):
+        return
+    if all(it["status"] in ("done", "failed") for it in batch["items"]):
+        batch["finished"] = time.time()
+        _cleanup_old_batches()
 
 
 BATCH_JS_BODY = """\
 let bFiles=[], bStarted=false, bItems=[], batchId=null, selIdx=-1, pollTimer=null;
 const COST_EST=0.05;
+const MAX_IMAGES=50;
 /* ── file handling ── */
 function addFiles(fileList){
   if(bStarted)return;
   for(let i=0;i<fileList.length;i++){
+    if(bFiles.length>=MAX_IMAGES){alert('单次最多 '+MAX_IMAGES+' 张图片');break;}
     const f=fileList[i];
     if(!f.type.startsWith('image/'))continue;
     bFiles.push({file:f, url:URL.createObjectURL(f)});
@@ -843,9 +900,14 @@ async def post_batch_start(request):
         return JSONResponse({"error": "\u8bf7\u5148\u8bbe\u7f6e API Key"}, status_code=400)
     if not prompt:
         return JSONResponse({"error": "\u8bf7\u8f93\u5165\u63d0\u793a\u8bcd"}, status_code=400)
+    # Rate-limit: max concurrent batches per user
+    if _user_active_batches(uid) >= _USER_MAX_BATCHES:
+        return JSONResponse({"error": f"\u6bcf\u4f4d\u7528\u6237\u6700\u591a\u540c\u65f6\u8fd0\u884c {_USER_MAX_BATCHES} \u4e2a\u6279\u6b21"}, status_code=429)
     raw_images = form.getlist("images")
     if not raw_images:
         return JSONResponse({"error": "\u8bf7\u4e0a\u4f20\u56fe\u7247"}, status_code=400)
+    if len(raw_images) > _BATCH_MAX_IMAGES:
+        return JSONResponse({"error": f"\u5355\u6b21\u6700\u591a {_BATCH_MAX_IMAGES} \u5f20\u56fe\u7247"}, status_code=400)
     batch_id = uuid.uuid4().hex[:12]
     items = []
     for upload in raw_images:
@@ -865,7 +927,8 @@ async def post_batch_start(request):
         })
     if not items:
         return JSONResponse({"error": "\u672a\u68c0\u6d4b\u5230\u6709\u6548\u56fe\u7247"}, status_code=400)
-    batches[batch_id] = {"prompt": prompt, "items": items, "uid": uid}
+    with _batches_lock:
+        batches[batch_id] = {"prompt": prompt, "items": items, "uid": uid, "finished": None}
     for item in items:
         batch_pool.submit(process_batch_item, batch_id, item["id"])
     return JSONResponse({"batch_id": batch_id})
