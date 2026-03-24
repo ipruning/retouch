@@ -14,13 +14,13 @@ sessions: dict = {}
 CSS = """\
 * { box-sizing: border-box; margin: 0; padding: 0; }
 :root { --fg: #111; --mg: #555; --lg: #aaa; --bg: #fff; --bd: #e0e0e0; }
-body { font-family: "PingFang SC", -apple-system, "Helvetica Neue", "Noto Sans SC", sans-serif; background: var(--bg); color: var(--fg); }
-.w { max-width: 520px; margin: 0 auto; padding: 56px 20px 40px; }
-.head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+body { font-family: "PingFang SC", -apple-system, "Helvetica Neue", "Noto Sans SC", sans-serif; background: var(--bg); color: var(--fg); height: 100vh; overflow: hidden; }
+.w { max-width: 520px; margin: 0 auto; display: flex; flex-direction: column; height: 100vh; }
+.head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0; flex-shrink: 0; }
 .head h1 { font-size: 16px; font-weight: 600; }
 .nb { font-size: 12px; color: var(--lg); cursor: pointer; border: 1px solid var(--bd); border-radius: 4px; padding: 3px 8px; background: none; }
 .nb:hover { color: var(--fg); border-color: var(--fg); }
-.tabs { display: flex; gap: 20px; margin-bottom: 20px; border-bottom: 1px solid var(--bd); }
+.tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--bd); padding: 0 20px; flex-shrink: 0; }
 .tab { padding: 6px 0; font-size: 13px; color: var(--lg); cursor: pointer; border-bottom: 1.5px solid transparent; margin-bottom: -1px; }
 .tab:hover { color: var(--mg); }
 .tab.on { color: var(--fg); border-bottom-color: var(--fg); }
@@ -39,7 +39,7 @@ textarea::placeholder { color: var(--lg); }
 .btn:hover { opacity: .85; }
 .btn:disabled { opacity: .4; cursor: default; }
 .hide { display: none; }
-.history { margin-bottom: 20px; }
+.history { flex: 1; overflow-y: auto; padding: 20px 20px 10px; }
 .turn { margin-bottom: 14px; }
 .turn .role { font-size: 11px; color: var(--lg); margin-bottom: 3px; }
 .turn .bubble { font-size: 14px; line-height: 1.6; color: var(--mg); }
@@ -47,6 +47,7 @@ textarea::placeholder { color: var(--lg); }
 .turn .user-text { color: var(--fg); }
 .divider { height: 1px; background: var(--bd); margin: 18px 0; }
 .err { margin-top: 14px; padding: 10px 12px; border-radius: 6px; background: #fef2f2; color: #b91c1c; font-size: 13px; }
+.input-area { flex-shrink: 0; padding: 10px 20px 20px; border-top: 1px solid var(--bd); background: var(--bg); }
 .spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: r .5s linear infinite; vertical-align: middle; margin-right: 6px; }
 @keyframes r { to { transform: rotate(360deg); } }
 .meta { font-size: 11px; color: var(--lg); margin-top: 8px; line-height: 1.6; }
@@ -125,7 +126,7 @@ async function go(){
     h.appendChild(mt);
     const dv=document.createElement('div');dv.className='divider';h.appendChild(dv);
     document.getElementById('prompt').value='';pastedFile=null;
-    window.scrollTo(0,document.body.scrollHeight);
+    const hd=document.getElementById('history');hd.scrollTop=hd.scrollHeight;
   }catch(e){alert(e.message);}
   finally{btn.disabled=false;btn.textContent=mode==='gen'?'\u751f\u6210':'\u7f16\u8f91';}
 }
@@ -153,18 +154,21 @@ def get():
         Div(id="history", cls="history"),
         Div(
             Div(
-                "\u70b9\u51fb\u4e0a\u4f20\u6216\u7c98\u8d34\u56fe\u7247",
-                Input(type="file", id="file", accept="image/*", onchange="pv(this)"),
-                id="dropzone", cls="drop"
+                Div(
+                    "\u70b9\u51fb\u4e0a\u4f20\u6216\u7c98\u8d34\u56fe\u7247",
+                    Input(type="file", id="file", accept="image/*", onchange="pv(this)"),
+                    id="dropzone", cls="drop"
+                ),
+                Div(id="thumb", cls="thumb"),
+                id="upload", cls="hide"
             ),
-            Div(id="thumb", cls="thumb"),
-            id="upload", cls="hide"
+            Div(
+                Textarea(id="prompt", placeholder="\u63cf\u8ff0\u4f60\u60f3\u8981\u7684\u56fe\u7247\u2026"),
+                cls="field"
+            ),
+            Button("\u751f\u6210", id="btn", cls="btn", onclick="go()"),
+            cls="input-area"
         ),
-        Div(
-            Textarea(id="prompt", placeholder="\u63cf\u8ff0\u4f60\u60f3\u8981\u7684\u56fe\u7247\u2026"),
-            cls="field"
-        ),
-        Button("\u751f\u6210", id="btn", cls="btn", onclick="go()"),
         Script(JS),
         cls="w"
     )
