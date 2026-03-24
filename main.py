@@ -1,4 +1,5 @@
-import uuid, os, traceback, json, hashlib
+import uuid, os, traceback, json, hashlib, zipfile, io
+from concurrent.futures import ThreadPoolExecutor
 from fasthtml.common import *
 from google import genai
 from google.genai import types
@@ -263,7 +264,10 @@ def get():
     return Div(
         Div(
             H1("\u56fe\u7247\u5de5\u4f5c\u53f0"),
-            Button("\u65b0\u5bf9\u8bdd", cls="nb", onclick="newChat()"),
+            Div(
+                A("\u6279\u91cf", href="/batch", cls="nb", style="text-decoration:none;margin-right:8px"),
+                Button("\u65b0\u5bf9\u8bdd", cls="nb", onclick="newChat()"),
+            ),
             cls="head"
         ),
         Div(
@@ -407,6 +411,1042 @@ def get_generated(fname: str):
     if os.path.exists(fpath):
         return FileResponse(fpath, media_type="image/png")
     return Response("Not found", status_code=404)
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BATCH MODE
+# ═══════════════════════════════════════════════════════════════════════════
+
+batch_pool = ThreadPoolExecutor(max_workers=3)
+batches: dict = {}          # batch_id -> {prompt, items: [...]}
+
+
+def _find_item(batch_id: str, item_id: str):
+    batch = batches.get(batch_id)
+    if not batch:
+        return None, None
+    for it in batch["items"]:
+        if it["id"] == item_id:
+            return batch, it
+    return batch, None
+
+
+def process_batch_item(batch_id: str, item_id: str):
+    """Run in a worker thread – process one image with the shared prompt."""
+    batch, item = _find_item(batch_id, item_id)
+    if not item:
+        return
+
+    item["status"] = "running"
+    try:
+        with open(item["src_path"], "rb") as f:
+            img_bytes = f.read()
+
+        response = gclient.models.generate_content(
+            model=MODEL,
+            contents=[types.Part.from_bytes(data=img_bytes,
+                                            mime_type=item["src_mime"]),
+                      batch["prompt"]],
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
+                response_modalities=["TEXT", "IMAGE"],
+            ),
+        )
+
+        result_url = None
+        result_text = ""
+        if response.candidates and response.candidates[0].content:
+            for part in (response.candidates[0].content.parts or []):
+                if getattr(part, "thought", False):
+                    continue
+                if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
+                    result_url = save_image(part.inline_data.data)
+                elif hasattr(part, "text") and part.text:
+                    result_text += part.text
+
+        # cost
+        cost = 0.0
+        um = getattr(response, "usage_metadata", None)
+        if um:
+            inp_t = um.prompt_token_count or 0
+            out_t = um.candidates_token_count or 0
+            think_t = um.thoughts_token_count or 0
+            img_t = 0
+            for d in (um.candidates_tokens_details or []):
+                if d.modality and d.modality.value == "IMAGE":
+                    img_t = d.token_count or 0
+            txt_out_t = out_t - img_t
+            cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
+
+        item["result_url"] = result_url
+        item["result_text"] = result_text
+        item["cost"] = cost
+        if result_url:
+            item["status"] = "done"
+        else:
+            item["status"] = "failed"
+            item["error"] = item.get("error") or "模型未返回图片"
+
+    except Exception as e:
+        traceback.print_exc()
+        item["status"] = "failed"
+        item["error"] = str(e)[:300]
+
+
+BATCH_CSS = """\
+/* ── batch page ── */
+.b-section { margin-bottom: 14px; }
+.b-section textarea {
+  width: 100%; min-height: 72px; padding: 10px 12px;
+  border: 1.5px solid var(--bd); border-radius: 8px;
+  font-size: 14px; font-family: inherit; color: var(--fg);
+  background: var(--bg); resize: vertical; outline: none;
+}
+.b-section textarea:focus { border-color: #999; }
+.b-section textarea::placeholder { color: var(--lg); }
+.b-drop {
+  position: relative; border: 2px dashed var(--bd); border-radius: 10px;
+  padding: 32px 16px; text-align: center; cursor: pointer;
+  margin-bottom: 14px; transition: border-color .2s, background .2s;
+}
+.b-drop.over { border-color: var(--fg); background: #fafafa; }
+.b-drop input[type=file] {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  opacity: 0; cursor: pointer;
+}
+.b-drop-text { font-size: 13px; color: var(--lg); pointer-events: none; }
+.b-drop-text em { font-style: normal; font-size: 28px; display: block; margin-bottom: 6px; }
+.b-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+  margin-bottom: 14px;
+}
+.b-thumb {
+  position: relative; aspect-ratio: 1; border-radius: 6px;
+  overflow: hidden; cursor: pointer; background: #f5f5f5;
+}
+.b-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.b-thumb .b-overlay {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; font-size: 22px; transition: background .3s;
+  pointer-events: none;
+}
+.b-thumb .b-remove {
+  position: absolute; top: 2px; right: 2px; width: 20px; height: 20px;
+  border-radius: 50%; background: rgba(0,0,0,.55); color: #fff;
+  font-size: 13px; line-height: 20px; text-align: center; cursor: pointer;
+  display: none; pointer-events: auto;
+}
+.b-thumb:hover .b-remove { display: block; }
+.b-thumb.selected { outline: 2.5px solid var(--fg); outline-offset: -2.5px; }
+.b-ov-pending  { background: rgba(0,0,0,.25); }
+.b-ov-running  { background: rgba(0,0,0,.35); }
+.b-ov-done     { background: rgba(0,180,0,.18); }
+.b-ov-failed   { background: rgba(200,0,0,.28); }
+.b-spin {
+  display: inline-block; width: 22px; height: 22px;
+  border: 2.5px solid rgba(255,255,255,.35); border-top-color: #fff;
+  border-radius: 50%; animation: r .6s linear infinite;
+}
+.b-controls { margin-bottom: 14px; }
+.b-estimate {
+  font-size: 13px; color: var(--mg); margin-bottom: 10px; text-align: center;
+}
+.b-start { width: 100%; }
+.b-progress { margin-bottom: 16px; }
+.b-progress-text {
+  font-size: 13px; color: var(--mg); margin-bottom: 6px;
+  display: flex; justify-content: space-between;
+}
+.b-bar {
+  height: 6px; background: #eee; border-radius: 3px; overflow: hidden;
+}
+.b-bar-fill {
+  height: 100%; width: 0; background: var(--fg); border-radius: 3px;
+  transition: width .4s ease;
+}
+.b-bar-fill.has-fail {
+  background: linear-gradient(90deg, var(--fg) var(--ok-pct), #e74c3c var(--ok-pct));
+}
+.b-compare {
+  border: 1.5px solid var(--bd); border-radius: 10px;
+  padding: 14px; margin-bottom: 14px;
+}
+.b-compare-title {
+  font-size: 12px; color: var(--lg); margin-bottom: 10px; text-align: center;
+}
+.b-compare-imgs {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  margin-bottom: 8px;
+}
+.b-compare-col { text-align: center; }
+.b-compare-label {
+  font-size: 11px; color: var(--lg); margin-bottom: 4px;
+}
+.b-compare-col img {
+  width: 100%; border-radius: 6px; display: block;
+  background: #f5f5f5; min-height: 60px;
+}
+.b-compare-meta {
+  font-size: 11px; color: var(--lg); text-align: center; margin-bottom: 6px;
+}
+.b-compare-error {
+  font-size: 13px; color: #b91c1c; background: #fef2f2;
+  padding: 8px 10px; border-radius: 6px; margin-bottom: 8px; text-align: center;
+}
+.b-retry-btn {
+  display: block; margin: 0 auto; padding: 6px 20px;
+  font-size: 13px; font-family: inherit;
+  background: none; border: 1.5px solid var(--bd); border-radius: 6px;
+  cursor: pointer; color: var(--fg);
+}
+.b-retry-btn:hover { border-color: var(--fg); }
+.b-done { margin-bottom: 20px; }
+.b-dl { width: 100%; }
+.head a.nb { text-decoration: none; }
+"""
+
+BATCH_JS = """\
+let bFiles=[], batchId=null, pollTimer=null, bItems=[], selIdx=-1, bStarted=false;
+const COST_EST=0.07;
+
+/* ── file handling ── */
+function addFiles(fileList){
+  if(bStarted)return;
+  for(let i=0;i<fileList.length;i++){
+    const f=fileList[i];
+    if(!f.type.startsWith('image/'))continue;
+    bFiles.push({file:f, url:URL.createObjectURL(f)});
+  }
+  renderGrid(); updateControls();
+}
+function removeFile(idx){
+  if(bStarted)return;
+  URL.revokeObjectURL(bFiles[idx].url);
+  bFiles.splice(idx,1);
+  if(selIdx===idx){selIdx=-1; hideCompare();}
+  else if(selIdx>idx) selIdx--;
+  renderGrid(); updateControls();
+}
+function renderGrid(){
+  const g=document.getElementById('b-grid'); let h='';
+  bFiles.forEach(function(bf,i){
+    const cls = i===selIdx ? 'b-thumb selected' : 'b-thumb';
+    const ovCls = bf.ov||'';
+    const ovContent = bf.ovIcon||'';
+    h+='<div class="'+cls+'" data-i="'+i+'" onclick="thumbClick('+i+')">'+
+       '<img src="'+bf.url+'">'+
+       '<div class="b-overlay '+ovCls+'">'+ovContent+'</div>';
+    if(!bStarted) h+='<div class="b-remove" onclick="event.stopPropagation();removeFile('+i+')">×</div>';
+    h+='</div>';
+  });
+  g.innerHTML=h;
+}
+function updateControls(){
+  const c=document.getElementById('b-controls');
+  const n=bFiles.length;
+  if(n===0){c.style.display='none';return;}
+  c.style.display='block';
+  document.getElementById('b-estimate').textContent=
+    '约 '+n+' 张 × $'+COST_EST.toFixed(2)+' ≈ $'+(n*COST_EST).toFixed(2);
+}
+
+/* ── drop zone ── */
+(function(){
+  const dz=document.getElementById('b-drop'), fi=document.getElementById('b-files');
+  dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('over');});
+  dz.addEventListener('dragleave',function(){dz.classList.remove('over');});
+  dz.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('over');addFiles(e.dataTransfer.files);});
+  fi.addEventListener('change',function(){addFiles(fi.files);fi.value='';});
+})();
+
+/* ── start batch ── */
+async function startBatch(){
+  const prompt=document.getElementById('b-prompt').value.trim();
+  if(!prompt){alert('请输入提示词');return;}
+  if(bFiles.length===0){alert('请上传图片');return;}
+  const btn=document.getElementById('b-start');
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span>上传中…';
+  const fd=new FormData();
+  fd.append('prompt',prompt);
+  bFiles.forEach(function(bf){fd.append('images',bf.file);});
+  try{
+    const r=await fetch('/batch/start',{method:'POST',body:fd});
+    const j=await r.json();
+    if(j.error){alert(j.error);btn.disabled=false;btn.textContent='开始处理';return;}
+    batchId=j.batch_id;
+    bStarted=true;
+    document.getElementById('b-drop').style.display='none';
+    document.getElementById('b-prompt').disabled=true;
+    btn.style.display='none';
+    document.getElementById('b-progress').style.display='block';
+    bFiles.forEach(function(bf){bf.ov='b-ov-pending';bf.ovIcon='⏳';});
+    renderGrid();
+    startPoll();
+  }catch(e){
+    alert('上传失败: '+e.message);
+    btn.disabled=false; btn.textContent='开始处理';
+  }
+}
+
+/* ── polling ── */
+function startPoll(){ pollTimer=setInterval(pollStatus,2000); pollStatus(); }
+function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} }
+
+async function pollStatus(){
+  if(!batchId)return;
+  try{
+    const r=await fetch('/batch/status/'+batchId);
+    const j=await r.json();
+    bItems=j.items;
+    let done=0,failed=0,running=0,cost=0;
+    j.items.forEach(function(it,i){
+      cost+=it.cost||0;
+      if(it.status==='done'){done++;bFiles[i].ov='b-ov-done';bFiles[i].ovIcon='✅';}
+      else if(it.status==='failed'){failed++;bFiles[i].ov='b-ov-failed';bFiles[i].ovIcon='❌';}
+      else if(it.status==='running'){running++;bFiles[i].ov='b-ov-running';bFiles[i].ovIcon='<div class="b-spin"></div>';}
+      else{bFiles[i].ov='b-ov-pending';bFiles[i].ovIcon='⏳';}
+    });
+    renderGrid();
+    const total=j.total, finished=done+failed;
+    const pct=total?Math.round(finished/total*100):0;
+    document.getElementById('b-progress-text').innerHTML=
+      '<span>进度 '+finished+'/'+total+'</span><span>$'+cost.toFixed(4)+'</span>';
+    const fill=document.getElementById('b-bar-fill');
+    fill.style.width=pct+'%';
+    if(failed>0){
+      fill.classList.add('has-fail');
+      const okPct=total?Math.round(done/total*100):0;
+      fill.style.setProperty('--ok-pct',okPct+'%');
+    }else{ fill.classList.remove('has-fail'); }
+    if(selIdx>=0) showCompare(selIdx);
+    if(finished>=total){
+      stopPoll();
+      if(done>0) document.getElementById('b-done').style.display='block';
+    }
+  }catch(e){console.error('poll error',e);}
+}
+
+/* ── thumbnail click / compare ── */
+function thumbClick(i){
+  selIdx = (selIdx===i) ? -1 : i;
+  renderGrid();
+  if(selIdx>=0) showCompare(selIdx);
+  else hideCompare();
+}
+function showCompare(i){
+  const c=document.getElementById('b-compare'); c.style.display='block';
+  document.getElementById('b-cmp-src').src=bFiles[i].url;
+  const it=bItems[i];
+  const title=document.getElementById('b-compare-title');
+  const resImg=document.getElementById('b-cmp-res');
+  const meta=document.getElementById('b-compare-meta');
+  const errEl=document.getElementById('b-compare-error');
+  const retryBtn=document.getElementById('b-retry-btn');
+  if(!it){
+    title.textContent='图片 '+(i+1)+' · 等待上传';
+    resImg.src=''; resImg.style.display='none';
+    meta.textContent=''; errEl.style.display='none'; retryBtn.style.display='none';
+    return;
+  }
+  title.textContent='图片 '+(i+1)+' · '+({pending:'等待中',running:'处理中',done:'完成',failed:'失败'}[it.status]||it.status);
+  if(it.result_url){
+    resImg.src=it.result_url; resImg.style.display='block';
+  }else{
+    resImg.src=''; resImg.style.display='none';
+  }
+  if(it.status==='done'){
+    meta.textContent='$'+(it.cost||0).toFixed(4)+(it.result_text?' · '+it.result_text.slice(0,80):'');
+  }else{ meta.textContent=''; }
+  if(it.status==='failed' && it.error){
+    errEl.textContent=it.error; errEl.style.display='block';
+  }else{ errEl.style.display='none'; }
+  retryBtn.style.display = it.status==='failed' ? 'block' : 'none';
+  c.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+function hideCompare(){
+  document.getElementById('b-compare').style.display='none';
+}
+
+/* ── retry ── */
+async function retrySelected(){
+  if(selIdx<0||!batchId)return;
+  const it=bItems[selIdx];
+  if(!it)return;
+  const btn=document.getElementById('b-retry-btn');
+  btn.disabled=true; btn.textContent='重试中…';
+  try{
+    await fetch('/batch/retry/'+batchId+'/'+it.id,{method:'POST'});
+    if(!pollTimer) startPoll();
+  }catch(e){alert('重试失败: '+e.message);}
+  finally{ btn.disabled=false; btn.textContent='重试'; }
+}
+
+/* ── download ── */
+function downloadZip(){
+  if(!batchId)return;
+  window.location.href='/batch/download/'+batchId;
+}
+"""
+
+
+@rt("/batch")
+def get_batch():
+    return Div(
+        Div(
+            H1("\u6279\u91cf\u5904\u7406"),
+            A("\u2190 \u5355\u5f20\u6a21\u5f0f", href="/", cls="nb"),
+            cls="head",
+        ),
+        Div(
+            # prompt
+            Div(
+                Textarea(id="b-prompt",
+                         placeholder="\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u5c06\u5e94\u7528\u5230\u6240\u6709\u56fe\u7247\u2026"),
+                cls="b-section",
+            ),
+            # drop zone
+            Div(
+                Input(type="file", id="b-files", multiple=True, accept="image/*"),
+                Div(NotStr("<em>\U0001F4C1</em>\u62d6\u62fd\u6216\u70b9\u51fb\u4e0a\u4f20\u56fe\u7247\uff08\u652f\u6301\u591a\u9009\uff09"), cls="b-drop-text"),
+                id="b-drop", cls="b-drop",
+            ),
+            # thumbnail grid
+            Div(id="b-grid", cls="b-grid"),
+            # controls
+            Div(
+                Div(id="b-estimate", cls="b-estimate"),
+                Button("\u5f00\u59cb\u5904\u7406", id="b-start", cls="btn b-start", onclick="startBatch()"),
+                id="b-controls", cls="b-controls", style="display:none",
+            ),
+            # progress
+            Div(
+                Div(id="b-progress-text", cls="b-progress-text"),
+                Div(Div(id="b-bar-fill", cls="b-bar-fill"), cls="b-bar"),
+                id="b-progress", cls="b-progress", style="display:none",
+            ),
+            # comparison panel
+            Div(
+                Div(id="b-compare-title", cls="b-compare-title"),
+                Div(
+                    Div(
+                        Div("\u539f\u56fe", cls="b-compare-label"),
+                        Img(id="b-cmp-src", src=""),
+                        cls="b-compare-col",
+                    ),
+                    Div(
+                        Div("\u7ed3\u679c", cls="b-compare-label"),
+                        Img(id="b-cmp-res", src=""),
+                        cls="b-compare-col",
+                    ),
+                    cls="b-compare-imgs",
+                ),
+                Div(id="b-compare-error", cls="b-compare-error", style="display:none"),
+                Div(id="b-compare-meta", cls="b-compare-meta"),
+                Button("\u91cd\u8bd5", id="b-retry-btn", cls="b-retry-btn",
+                       style="display:none", onclick="retrySelected()"),
+                id="b-compare", cls="b-compare", style="display:none",
+            ),
+            # download
+            Div(
+                Button("\u6253\u5305\u4e0b\u8f7d", cls="btn b-dl", onclick="downloadZip()"),
+                id="b-done", cls="b-done", style="display:none",
+            ),
+            id="main", cls="main",
+        ),
+        Style(BATCH_CSS),
+        Script(BATCH_JS),
+        cls="w",
+    )
+
+
+@rt("/batch/start", methods=["POST"])
+async def post_batch_start(request):
+    form = await request.form()
+    prompt = form.get("prompt", "").strip()
+    if not prompt:
+        return JSONResponse({"error": "\u8bf7\u8f93\u5165\u63d0\u793a\u8bcd"}, status_code=400)
+
+    raw_images = form.getlist("images")
+    if not raw_images:
+        return JSONResponse({"error": "\u8bf7\u4e0a\u4f20\u56fe\u7247"}, status_code=400)
+
+    batch_id = uuid.uuid4().hex[:12]
+    items = []
+
+    for upload in raw_images:
+        if not hasattr(upload, "read"):
+            continue
+        data = await upload.read()
+        if not data or len(data) < 100:
+            continue
+        item_id = uuid.uuid4().hex[:8]
+        src_url = save_image(data)
+        src_path = os.path.join(GEN_DIR, os.path.basename(src_url))
+        mime = getattr(upload, "content_type", None) or "image/png"
+        items.append({
+            "id":          item_id,
+            "status":      "pending",
+            "src_url":     src_url,
+            "src_path":    src_path,
+            "src_mime":    mime,
+            "result_url":  None,
+            "result_text": None,
+            "error":       None,
+            "cost":        0.0,
+        })
+
+    if not items:
+        return JSONResponse({"error": "\u672a\u68c0\u6d4b\u5230\u6709\u6548\u56fe\u7247"}, status_code=400)
+
+    batches[batch_id] = {"prompt": prompt, "items": items}
+
+    for item in items:
+        batch_pool.submit(process_batch_item, batch_id, item["id"])
+
+    return JSONResponse({"batch_id": batch_id})
+
+
+@rt("/batch/status/{batch_id}")
+def get_batch_status(batch_id: str):
+    batch = batches.get(batch_id)
+    if not batch:
+        return JSONResponse({"error": "\u6279\u6b21\u4e0d\u5b58\u5728"}, status_code=404)
+
+    items_out = []
+    total = len(batch["items"])
+    done = failed = running = 0
+    cost = 0.0
+
+    for it in batch["items"]:
+        s = it["status"]
+        if s == "done":    done += 1
+        elif s == "failed": failed += 1
+        elif s == "running": running += 1
+        cost += it["cost"]
+        items_out.append({
+            "id":          it["id"],
+            "status":      it["status"],
+            "src_url":     it["src_url"],
+            "result_url":  it["result_url"],
+            "result_text": it["result_text"],
+            "error":       it["error"],
+            "cost":        it["cost"],
+        })
+
+    return JSONResponse({
+        "total":   total,
+        "done":    done,
+        "failed":  failed,
+        "running": running,
+        "cost":    round(cost, 6),
+        "items":   items_out,
+    })
+
+
+@rt("/batch/retry/{batch_id}/{item_id}", methods=["POST"])
+def post_batch_retry(batch_id: str, item_id: str):
+    batch, item = _find_item(batch_id, item_id)
+    if not item:
+        return JSONResponse({"error": "\u672a\u627e\u5230"}, status_code=404)
+    if item["status"] not in ("failed",):
+        return JSONResponse({"error": "\u72b6\u6001\u4e0d\u5141\u8bb8\u91cd\u8bd5"}, status_code=400)
+
+    item["status"] = "pending"
+    item["error"] = None
+    item["result_url"] = None
+    item["result_text"] = None
+    item["cost"] = 0.0
+    batch_pool.submit(process_batch_item, batch_id, item_id)
+    return JSONResponse({"ok": True})
+
+
+@rt("/batch/download/{batch_id}")
+def get_batch_download(batch_id: str):
+    batch = batches.get(batch_id)
+    if not batch:
+        return Response("\u6279\u6b21\u4e0d\u5b58\u5728", status_code=404)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        idx = 0
+        for it in batch["items"]:
+            if it["status"] != "done" or not it["result_url"]:
+                continue
+            idx += 1
+            fname = os.path.basename(it["result_url"])
+            fpath = os.path.join(GEN_DIR, fname)
+            if os.path.exists(fpath):
+                ext = os.path.splitext(fname)[1] or ".jpg"
+                zf.write(fpath, f"result_{idx:03d}{ext}")
+    buf.seek(0)
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="batch_{batch_id}.zip"'
+        },
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# BATCH MODE
+# ═══════════════════════════════════════════════════════════════
+
+BATCH_CSS = """
+.b-section { margin-bottom: 14px; }
+.b-section textarea {
+  width: 100%; min-height: 72px; padding: 10px 12px;
+  border: 1.5px solid var(--bd); border-radius: 8px;
+  font-size: 14px; font-family: inherit; color: var(--fg);
+  background: var(--bg); resize: vertical; outline: none;
+}
+.b-section textarea:focus { border-color: #999; }
+.b-section textarea::placeholder { color: var(--lg); }
+.b-drop {
+  position: relative; border: 2px dashed var(--bd); border-radius: 10px;
+  padding: 32px 16px; text-align: center; cursor: pointer;
+  margin-bottom: 14px; transition: border-color .2s, background .2s;
+}
+.b-drop.over { border-color: var(--fg); background: #fafafa; }
+.b-drop input[type=file] {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  opacity: 0; cursor: pointer;
+}
+.b-drop-text { font-size: 13px; color: var(--lg); pointer-events: none; }
+.b-drop-text em { font-style: normal; font-size: 28px; display: block; margin-bottom: 6px; }
+.b-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+  margin-bottom: 14px;
+}
+.b-thumb {
+  position: relative; aspect-ratio: 1; border-radius: 6px;
+  overflow: hidden; cursor: pointer; background: #f5f5f5;
+}
+.b-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.b-thumb .b-overlay {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; font-size: 22px; pointer-events: none;
+}
+.b-thumb .b-remove {
+  position: absolute; top: 2px; right: 2px; width: 20px; height: 20px;
+  border-radius: 50%; background: rgba(0,0,0,.55); color: #fff;
+  font-size: 13px; line-height: 20px; text-align: center; cursor: pointer;
+  display: none; pointer-events: auto;
+}
+.b-thumb:hover .b-remove { display: block; }
+.b-thumb.selected { outline: 2.5px solid var(--fg); outline-offset: -2.5px; }
+.b-ov-pending  { background: rgba(0,0,0,.25); }
+.b-ov-running  { background: rgba(0,0,0,.35); }
+.b-ov-done     { background: rgba(0,180,0,.18); }
+.b-ov-failed   { background: rgba(200,0,0,.28); }
+.b-spin {
+  display: inline-block; width: 22px; height: 22px;
+  border: 2.5px solid rgba(255,255,255,.35); border-top-color: #fff;
+  border-radius: 50%; animation: r .6s linear infinite;
+}
+.b-controls { margin-bottom: 14px; }
+.b-estimate {
+  font-size: 13px; color: var(--mg); margin-bottom: 10px; text-align: center;
+}
+.b-progress { margin-bottom: 16px; }
+.b-progress-text {
+  font-size: 13px; color: var(--mg); margin-bottom: 6px;
+  display: flex; justify-content: space-between;
+}
+.b-bar { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; }
+.b-bar-fill {
+  height: 100%; width: 0; background: var(--fg); border-radius: 3px;
+  transition: width .4s ease;
+}
+.b-bar-fill.has-fail {
+  background: linear-gradient(90deg, var(--fg) var(--ok-pct), #e74c3c var(--ok-pct));
+}
+.b-compare {
+  border: 1.5px solid var(--bd); border-radius: 10px;
+  padding: 14px; margin-bottom: 14px;
+}
+.b-compare-title { font-size: 12px; color: var(--lg); margin-bottom: 10px; text-align: center; }
+.b-compare-imgs {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px;
+}
+.b-compare-col { text-align: center; }
+.b-compare-label { font-size: 11px; color: var(--lg); margin-bottom: 4px; }
+.b-compare-col img { width: 100%; border-radius: 6px; display: block; background: #f5f5f5; min-height: 60px; }
+.b-compare-meta { font-size: 11px; color: var(--lg); text-align: center; margin-bottom: 6px; }
+.b-compare-error {
+  font-size: 13px; color: #b91c1c; background: #fef2f2;
+  padding: 8px 10px; border-radius: 6px; margin-bottom: 8px; text-align: center;
+}
+.b-retry-btn {
+  display: block; margin: 0 auto; padding: 6px 20px; font-size: 13px; font-family: inherit;
+  background: none; border: 1.5px solid var(--bd); border-radius: 6px; cursor: pointer; color: var(--fg);
+}
+.b-retry-btn:hover { border-color: var(--fg); }
+.b-done { margin-bottom: 20px; }
+.b-dl { width: 100%; }
+"""
+
+BATCH_JS = """
+let bFiles=[], batchId=null, pollTimer=null, bItems=[], selIdx=-1, bStarted=false;
+const COST_EST=0.07;
+function addFiles(fileList){
+  if(bStarted)return;
+  for(let i=0;i<fileList.length;i++){
+    const f=fileList[i];
+    if(!f.type.startsWith('image/'))continue;
+    bFiles.push({file:f, url:URL.createObjectURL(f)});
+  }
+  renderGrid(); updateControls();
+}
+function removeFile(idx){
+  if(bStarted)return;
+  URL.revokeObjectURL(bFiles[idx].url);
+  bFiles.splice(idx,1);
+  if(selIdx===idx){selIdx=-1; hideCompare();}
+  else if(selIdx>idx) selIdx--;
+  renderGrid(); updateControls();
+}
+function renderGrid(){
+  const g=document.getElementById('b-grid'); let h='';
+  bFiles.forEach(function(bf,i){
+    const cls = i===selIdx ? 'b-thumb selected' : 'b-thumb';
+    const ovCls = bf.ov||'';
+    const ovContent = bf.ovIcon||'';
+    h+='<div class="'+cls+'" onclick="thumbClick('+i+')">';
+    h+='<img src="'+bf.url+'">';
+    h+='<div class="b-overlay '+ovCls+'">'+ovContent+'</div>';
+    if(!bStarted) h+='<div class="b-remove" onclick="event.stopPropagation();removeFile('+i+')">' + String.fromCharCode(215) + '</div>';
+    h+='</div>';
+  });
+  g.innerHTML=h;
+}
+function updateControls(){
+  const c=document.getElementById('b-controls');
+  const n=bFiles.length;
+  if(n===0){c.style.display='none';return;}
+  c.style.display='block';
+  document.getElementById('b-estimate').textContent=
+    String.fromCodePoint(0x7EA6)+' '+n+' '+String.fromCodePoint(0x5F20)+' '+String.fromCharCode(215)+' $'+COST_EST.toFixed(2)+' '+String.fromCharCode(8776)+' $'+(n*COST_EST).toFixed(2);
+}
+(function(){
+  const dz=document.getElementById('b-drop'), fi=document.getElementById('b-files');
+  dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('over');});
+  dz.addEventListener('dragleave',function(){dz.classList.remove('over');});
+  dz.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('over');addFiles(e.dataTransfer.files);});
+  fi.addEventListener('change',function(){addFiles(fi.files);fi.value='';});
+})();
+async function startBatch(){
+  var prompt=document.getElementById('b-prompt').value.trim();
+  if(!prompt){alert('\u8bf7\u8f93\u5165\u63d0\u793a\u8bcd');return;}
+  if(bFiles.length===0){alert('\u8bf7\u4e0a\u4f20\u56fe\u7247');return;}
+  var btn=document.getElementById('b-start');
+  btn.disabled=true; btn.innerHTML='<span class="spin"></span>\u4e0a\u4f20\u4e2d\u2026';
+  var fd=new FormData();
+  fd.append('prompt',prompt);
+  bFiles.forEach(function(bf){fd.append('images',bf.file);});
+  try{
+    var r=await fetch('/batch/start',{method:'POST',body:fd});
+    var j=await r.json();
+    if(j.error){alert(j.error);btn.disabled=false;btn.textContent='\u5f00\u59cb\u5904\u7406';return;}
+    batchId=j.batch_id;
+    bStarted=true;
+    document.getElementById('b-drop').style.display='none';
+    document.getElementById('b-prompt').disabled=true;
+    btn.style.display='none';
+    document.getElementById('b-progress').style.display='block';
+    bFiles.forEach(function(bf){bf.ov='b-ov-pending';bf.ovIcon='\u23f3';});
+    renderGrid();
+    startPoll();
+  }catch(e){
+    alert(e.message);
+    btn.disabled=false; btn.textContent='\u5f00\u59cb\u5904\u7406';
+  }
+}
+function startPoll(){ pollTimer=setInterval(pollStatus,2000); pollStatus(); }
+function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} }
+async function pollStatus(){
+  if(!batchId)return;
+  try{
+    var r=await fetch('/batch/status/'+batchId);
+    var j=await r.json();
+    bItems=j.items;
+    var done=0,failed=0;
+    j.items.forEach(function(it,i){
+      if(it.status==='done'){done++;bFiles[i].ov='b-ov-done';bFiles[i].ovIcon='\u2705';}
+      else if(it.status==='failed'){failed++;bFiles[i].ov='b-ov-failed';bFiles[i].ovIcon='\u274c';}
+      else if(it.status==='running'){bFiles[i].ov='b-ov-running';bFiles[i].ovIcon='<div class="b-spin"></div>';}
+      else{bFiles[i].ov='b-ov-pending';bFiles[i].ovIcon='\u23f3';}
+    });
+    renderGrid();
+    var total=j.total, finished=done+failed;
+    var pct=total?Math.round(finished/total*100):0;
+    document.getElementById('b-progress-text').innerHTML=
+      '<span>\u8fdb\u5ea6 '+finished+'/'+total+'</span><span>$'+j.cost.toFixed(4)+'</span>';
+    var fill=document.getElementById('b-bar-fill');
+    fill.style.width=pct+'%';
+    if(failed>0){
+      fill.classList.add('has-fail');
+      fill.style.setProperty('--ok-pct',(total?Math.round(done/total*100):0)+'%');
+    }else{ fill.classList.remove('has-fail'); }
+    if(selIdx>=0) showCompare(selIdx);
+    if(finished>=total){
+      stopPoll();
+      if(done>0) document.getElementById('b-done').style.display='block';
+    }
+  }catch(e){console.error('poll',e);}
+}
+function thumbClick(i){
+  selIdx = (selIdx===i) ? -1 : i;
+  renderGrid();
+  if(selIdx>=0) showCompare(selIdx); else hideCompare();
+}
+function showCompare(i){
+  var c=document.getElementById('b-compare'); c.style.display='block';
+  document.getElementById('b-cmp-src').src=bFiles[i].url;
+  var it=bItems[i];
+  var title=document.getElementById('b-compare-title');
+  var resImg=document.getElementById('b-cmp-res');
+  var meta=document.getElementById('b-compare-meta');
+  var errEl=document.getElementById('b-compare-error');
+  var retryBtn=document.getElementById('b-retry-btn');
+  if(!it){
+    title.textContent='\u56fe\u7247 '+(i+1);
+    resImg.src=''; resImg.style.display='none';
+    meta.textContent=''; errEl.style.display='none'; retryBtn.style.display='none';
+    return;
+  }
+  var labels={pending:'\u7b49\u5f85\u4e2d',running:'\u5904\u7406\u4e2d',done:'\u5b8c\u6210',failed:'\u5931\u8d25'};
+  title.textContent='\u56fe\u7247 '+(i+1)+' \u00b7 '+(labels[it.status]||it.status);
+  if(it.result_url){resImg.src=it.result_url;resImg.style.display='block';}
+  else{resImg.src='';resImg.style.display='none';}
+  meta.textContent=(it.status==='done')?'$'+(it.cost||0).toFixed(4):'';
+  if(it.status==='failed'&&it.error){errEl.textContent=it.error;errEl.style.display='block';}
+  else{errEl.style.display='none';}
+  retryBtn.style.display=it.status==='failed'?'block':'none';
+  c.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+function hideCompare(){ document.getElementById('b-compare').style.display='none'; }
+async function retrySelected(){
+  if(selIdx<0||!batchId)return;
+  var it=bItems[selIdx];if(!it)return;
+  var btn=document.getElementById('b-retry-btn');
+  btn.disabled=true; btn.textContent='\u91cd\u8bd5\u4e2d\u2026';
+  try{
+    await fetch('/batch/retry/'+batchId+'/'+it.id,{method:'POST'});
+    if(!pollTimer) startPoll();
+  }catch(e){alert(e.message);}
+  finally{ btn.disabled=false; btn.textContent='\u91cd\u8bd5'; }
+}
+function downloadZip(){
+  if(!batchId)return;
+  window.location.href='/batch/download/'+batchId;
+}
+"""
+
+
+def process_batch_item(batch_id: str, item_id: str):
+    batch = batches.get(batch_id)
+    if not batch:
+        return
+    item = None
+    for it in batch["items"]:
+        if it["id"] == item_id:
+            item = it
+            break
+    if not item:
+        return
+    item["status"] = "running"
+    try:
+        with open(item["src_path"], "rb") as f:
+            img_bytes = f.read()
+        response = gclient.models.generate_content(
+            model=MODEL,
+            contents=[types.Part.from_bytes(data=img_bytes, mime_type=item["src_mime"]),
+                      batch["prompt"]],
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
+                response_modalities=["TEXT", "IMAGE"],
+            ),
+        )
+        result_url = None
+        result_text = ""
+        if response.candidates and response.candidates[0].content:
+            for part in (response.candidates[0].content.parts or []):
+                if getattr(part, "thought", False):
+                    continue
+                if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
+                    result_url = save_image(part.inline_data.data)
+                elif hasattr(part, "text") and part.text:
+                    result_text += part.text
+        um = getattr(response, "usage_metadata", None)
+        cost = 0.0
+        if um:
+            inp_t = um.prompt_token_count or 0
+            out_t = um.candidates_token_count or 0
+            think_t = um.thoughts_token_count or 0
+            img_t = 0
+            for d in (um.candidates_tokens_details or []):
+                if d.modality and d.modality.value == "IMAGE":
+                    img_t = d.token_count or 0
+            txt_out_t = out_t - img_t
+            cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
+        item["result_url"] = result_url
+        item["result_text"] = result_text
+        item["cost"] = cost
+        item["status"] = "done" if result_url else "failed"
+        if not result_url:
+            item["error"] = "\u6a21\u578b\u672a\u8fd4\u56de\u56fe\u7247"
+    except Exception as e:
+        traceback.print_exc()
+        item["status"] = "failed"
+        item["error"] = str(e)[:300]
+
+
+@rt("/batch")
+def get_batch():
+    return Div(
+        Div(
+            H1("\u6279\u91cf\u5904\u7406"),
+            A("\u2190 \u5355\u5f20\u6a21\u5f0f", href="/", cls="nb", style="text-decoration:none"),
+            cls="head",
+        ),
+        Div(
+            Div(Textarea(id="b-prompt", placeholder="\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u5c06\u5e94\u7528\u5230\u6240\u6709\u56fe\u7247\u2026"), cls="b-section"),
+            Div(
+                Input(type="file", id="b-files", multiple=True, accept="image/*"),
+                Div(NotStr("<em>\U0001f4c1</em>\u62d6\u62fd\u6216\u70b9\u51fb\u4e0a\u4f20\u56fe\u7247\uff08\u652f\u6301\u591a\u9009\uff09"), cls="b-drop-text"),
+                id="b-drop", cls="b-drop",
+            ),
+            Div(id="b-grid", cls="b-grid"),
+            Div(
+                Div(id="b-estimate", cls="b-estimate"),
+                Button("\u5f00\u59cb\u5904\u7406", id="b-start", cls="btn", onclick="startBatch()"),
+                id="b-controls", cls="b-controls", style="display:none",
+            ),
+            Div(
+                Div(id="b-progress-text", cls="b-progress-text"),
+                Div(Div(id="b-bar-fill", cls="b-bar-fill"), cls="b-bar"),
+                id="b-progress", cls="b-progress", style="display:none",
+            ),
+            Div(
+                Div(id="b-compare-title", cls="b-compare-title"),
+                Div(
+                    Div(Div("\u539f\u56fe", cls="b-compare-label"), Img(id="b-cmp-src", src=""), cls="b-compare-col"),
+                    Div(Div("\u7ed3\u679c", cls="b-compare-label"), Img(id="b-cmp-res", src=""), cls="b-compare-col"),
+                    cls="b-compare-imgs",
+                ),
+                Div(id="b-compare-error", cls="b-compare-error", style="display:none"),
+                Div(id="b-compare-meta", cls="b-compare-meta"),
+                Button("\u91cd\u8bd5", id="b-retry-btn", cls="b-retry-btn", style="display:none", onclick="retrySelected()"),
+                id="b-compare", cls="b-compare", style="display:none",
+            ),
+            Div(
+                Button("\u6253\u5305\u4e0b\u8f7d", cls="btn b-dl", onclick="downloadZip()"),
+                id="b-done", cls="b-done", style="display:none",
+            ),
+            id="main", cls="main",
+        ),
+        Style(BATCH_CSS),
+        Script(BATCH_JS),
+        cls="w",
+    )
+
+
+@rt("/batch/start", methods=["POST"])
+async def post_batch_start(request):
+    form = await request.form()
+    prompt = form.get("prompt", "").strip()
+    if not prompt:
+        return JSONResponse({"error": "\u8bf7\u8f93\u5165\u63d0\u793a\u8bcd"}, status_code=400)
+    raw_images = form.getlist("images")
+    if not raw_images:
+        return JSONResponse({"error": "\u8bf7\u4e0a\u4f20\u56fe\u7247"}, status_code=400)
+    batch_id = uuid.uuid4().hex[:12]
+    items = []
+    for upload in raw_images:
+        if not hasattr(upload, "read"):
+            continue
+        data = await upload.read()
+        if not data or len(data) < 100:
+            continue
+        item_id = uuid.uuid4().hex[:8]
+        src_url = save_image(data)
+        src_path = os.path.join(GEN_DIR, os.path.basename(src_url))
+        mime = getattr(upload, "content_type", None) or "image/png"
+        items.append({
+            "id": item_id, "status": "pending",
+            "src_url": src_url, "src_path": src_path, "src_mime": mime,
+            "result_url": None, "result_text": None, "error": None, "cost": 0.0,
+        })
+    if not items:
+        return JSONResponse({"error": "\u672a\u68c0\u6d4b\u5230\u6709\u6548\u56fe\u7247"}, status_code=400)
+    batches[batch_id] = {"prompt": prompt, "items": items}
+    for item in items:
+        batch_pool.submit(process_batch_item, batch_id, item["id"])
+    return JSONResponse({"batch_id": batch_id})
+
+
+@rt("/batch/status/{batch_id}")
+def get_batch_status(batch_id: str):
+    batch = batches.get(batch_id)
+    if not batch:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    items_out = []
+    done = failed = running = 0
+    cost = 0.0
+    for it in batch["items"]:
+        s = it["status"]
+        if s == "done": done += 1
+        elif s == "failed": failed += 1
+        elif s == "running": running += 1
+        cost += it["cost"]
+        items_out.append({k: it[k] for k in ("id", "status", "src_url", "result_url", "result_text", "error", "cost")})
+    return JSONResponse({"total": len(batch["items"]), "done": done, "failed": failed,
+                         "running": running, "cost": round(cost, 6), "items": items_out})
+
+
+@rt("/batch/retry/{batch_id}/{item_id}", methods=["POST"])
+def post_batch_retry(batch_id: str, item_id: str):
+    batch = batches.get(batch_id)
+    if not batch:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    item = None
+    for it in batch["items"]:
+        if it["id"] == item_id:
+            item = it
+            break
+    if not item or item["status"] != "failed":
+        return JSONResponse({"error": "cannot retry"}, status_code=400)
+    item["status"] = "pending"
+    item["error"] = None
+    item["result_url"] = None
+    item["cost"] = 0.0
+    batch_pool.submit(process_batch_item, batch_id, item_id)
+    return JSONResponse({"ok": True})
+
+
+@rt("/batch/download/{batch_id}")
+def get_batch_download(batch_id: str):
+    batch = batches.get(batch_id)
+    if not batch:
+        return Response("not found", status_code=404)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        idx = 0
+        for it in batch["items"]:
+            if it["status"] != "done" or not it["result_url"]:
+                continue
+            idx += 1
+            fname = os.path.basename(it["result_url"])
+            fpath = os.path.join(GEN_DIR, fname)
+            if os.path.exists(fpath):
+                ext = os.path.splitext(fname)[1] or ".jpg"
+                zf.write(fpath, f"result_{idx:03d}{ext}")
+    buf.seek(0)
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="batch_{batch_id}.zip"'})
 
 
 serve(host="0.0.0.0", port=8000)
