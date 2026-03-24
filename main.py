@@ -1,6 +1,7 @@
 import uuid, os, traceback, json, hashlib, zipfile, io
 from concurrent.futures import ThreadPoolExecutor
 from fasthtml.common import *
+from monsterui.all import *
 from google import genai
 from google.genai import types
 from starlette.responses import StreamingResponse
@@ -9,18 +10,14 @@ MODEL = "gemini-3.1-flash-image-preview"
 GEN_DIR = "generated"
 os.makedirs(GEN_DIR, exist_ok=True)
 
-# Per-user state: api_keys[uid] = key_string, clients[uid] = genai.Client
 api_keys: dict = {}
 clients: dict = {}
 sessions: dict = {}
 
 def get_client(uid: str):
-    """Return genai.Client for uid, or None if no key set."""
     return clients.get(uid)
 
-
 def save_image(data: bytes) -> str:
-    """Save image bytes, deduplicate by content hash, return URL path."""
     h = hashlib.md5(data).hexdigest()
     fname = f"{h}.jpg"
     fpath = os.path.join(GEN_DIR, fname)
@@ -29,9 +26,7 @@ def save_image(data: bytes) -> str:
             f.write(data)
     return f"/generated/{fname}"
 
-
 def build_context(sid: str) -> dict:
-    """Build context structure from chat history for UI display."""
     if sid not in sessions:
         return {"turns": [], "total_bytes": 0}
     chat = sessions[sid]
@@ -56,148 +51,110 @@ def build_context(sid: str) -> dict:
     return {"turns": turns, "total_bytes": total_bytes}
 
 
-CSS = """\
-* { box-sizing: border-box; margin: 0; padding: 0; }
-:root { --fg: #111; --mg: #555; --lg: #aaa; --bg: #fff; --bd: #e0e0e0; }
-body { font-family: "PingFang SC", -apple-system, "Helvetica Neue", "Noto Sans SC", sans-serif;
-       background: var(--bg); color: var(--fg); height: 100vh; overflow: hidden; }
-.w { max-width: 520px; margin: 0 auto; display: flex; flex-direction: column; height: 100vh; }
-.head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 12px; flex-shrink: 0; }
-.head h1 { font-size: 16px; font-weight: 600; }
-.nb { font-size: 12px; color: var(--lg); cursor: pointer; border: 1px solid var(--bd); border-radius: 4px; padding: 3px 8px; background: none; }
-.nb:hover { color: var(--fg); border-color: var(--fg); }
-
-/* Main scrollable area */
-.main { flex: 1; overflow-y: auto; padding: 0 20px 24px; }
-
-/* Envelope */
-.envelope { border: 1.5px solid var(--bd); border-radius: 10px; padding: 0; overflow: hidden; }
-.env-head { font-size: 11px; color: var(--lg); padding: 10px 14px 0; }
-.ctx-list { padding: 6px 14px 0; }
-.ctx-empty { font-size: 13px; color: var(--lg); padding: 4px 0; }
-.ctx-turn { display: flex; gap: 8px; padding: 3px 0; font-size: 13px; line-height: 1.6; align-items: center; }
-.ctx-role { color: var(--mg); font-weight: 500; flex-shrink: 0; min-width: 26px; }
-.ctx-parts { color: var(--lg); display: flex; align-items: center; gap: 6px; min-width: 0; }
-.ctx-parts .ctx-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ctx-thumb { width: 28px; height: 28px; border-radius: 3px; object-fit: cover; flex-shrink: 0; }
-.ctx-img-label { white-space: nowrap; }
-.ctx-sep { border-top: 1.5px dashed var(--bd); margin: 8px 14px 0; }
-
-/* Upload preview inside envelope */
-.upload-preview { display: flex; align-items: center; gap: 8px; padding: 8px 14px 0; }
-.upload-preview img { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; }
-.upload-preview .upload-name { font-size: 12px; color: var(--mg); }
-.upload-preview .upload-x { background: none; border: none; color: var(--lg); font-size: 16px; cursor: pointer; padding: 0 4px; }
-.upload-preview .upload-x:hover { color: var(--fg); }
-.hide { display: none; }
-
-/* Input inside envelope */
-.env-input { padding: 8px 14px; }
-.env-input textarea { width: 100%; min-height: 48px; padding: 8px 10px; border: 1px solid var(--bd); border-radius: 6px;
-                       font-size: 14px; font-family: inherit; color: var(--fg); background: var(--bg);
-                       resize: vertical; outline: none; }
-.env-input textarea:focus { border-color: #999; }
-.env-input textarea::placeholder { color: var(--lg); }
-.env-actions { display: flex; gap: 8px; padding: 0 14px 10px; align-items: center; }
-.env-actions .attach { font-size: 12px; color: var(--lg); cursor: pointer; position: relative; }
-.env-actions .attach:hover { color: var(--mg); }
-.env-actions .attach input { position: absolute; inset: 0; opacity: 0; width: 100%; cursor: pointer; }
-.btn { flex: 1; padding: 9px; background: var(--fg); color: #fff; border: none; border-radius: 6px;
-       font-size: 14px; font-weight: 500; cursor: pointer; font-family: inherit; }
-.btn:hover { opacity: .85; }
-.btn:disabled { opacity: .4; cursor: default; }
-.env-footer { font-size: 11px; color: var(--lg); padding: 0 14px 10px; line-height: 1.4; }
-
-/* Result area */
-.result-area { margin-top: 16px; }
-.result { margin-bottom: 16px; }
-.result img { width: 100%; border-radius: 8px; display: block; margin-top: 4px; }
-.result-text { font-size: 14px; line-height: 1.6; color: var(--mg); margin-bottom: 4px; }
-.meta { font-size: 11px; color: var(--lg); margin-top: 8px; line-height: 1.6; }
-.meta span { margin-right: 10px; }
-.err { padding: 10px 12px; border-radius: 6px; background: #fef2f2; color: #b91c1c; font-size: 13px; }
-.spin { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.3);
-        border-top-color: #fff; border-radius: 50%; animation: r .5s linear infinite;
-        vertical-align: middle; margin-right: 6px; }
-@keyframes r { to { transform: rotate(360deg); } }
-.streaming-text { display: inline; }
-.cursor-blink { display: inline-block; width: 2px; height: 14px; background: var(--fg);
-                margin-left: 2px; vertical-align: text-bottom; animation: blink .8s step-end infinite; }
-@keyframes blink { 50% { opacity: 0; } }
-
-/* Key modal */
-.key-modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex;
-  align-items:center; justify-content:center; z-index:999; }
-.key-modal.hide { display:none; }
-.key-box { background:#fff; border-radius:12px; padding:24px 28px; width:380px;
-  max-width:90vw; box-shadow:0 8px 32px rgba(0,0,0,.18); }
-.key-box h3 { margin:0 0 6px; font-size:17px; }
-.key-hint { font-size:12px; color:#888; margin:0 0 14px; }
-.key-hint a { color:#4285f4; }
-.key-field { width:100%; padding:10px 12px; border:1px solid #ccc; border-radius:8px;
-  font-size:14px; box-sizing:border-box; font-family:monospace; }
-.key-field:focus { outline:none; border-color:#4285f4; }
-.key-actions { margin-top:14px; display:flex; align-items:center; }
-.key-msg { margin-top:10px; font-size:12px; min-height:18px; }
-.key-msg.err { color:#d32f2f; }
-.key-msg.ok { color:#2e7d32; }
-.key-status { font-size:11px; color:#888; margin-right:4px; vertical-align:middle; }
-.key-status.active { color:#2e7d32; }
-.key-btn { font-size:16px !important; padding:4px 6px !important; }
+EXTRA_CSS = """\
+.ctx-turn { display:flex; gap:6px; align-items:center; padding:4px 0; font-size:13px; }
+.ctx-role { font-weight:600; white-space:nowrap; color:var(--color-muted-foreground); }
+.ctx-parts { display:flex; flex-wrap:wrap; gap:4px; align-items:center; }
+.ctx-text { color:var(--color-muted-foreground); max-width:300px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ctx-thumb { width:28px; height:28px; border-radius:4px; object-fit:cover; }
+.ctx-img-label { font-size:11px; color:var(--color-muted-foreground); }
+.ctx-empty { color:var(--color-muted-foreground); font-size:13px; padding:4px 0; }
+.upload-preview { display:flex; align-items:center; gap:8px; padding:8px 0; }
+.upload-preview.hide { display:none; }
+.upload-preview img { width:48px; height:48px; border-radius:6px; object-fit:cover; }
+.upload-name { font-size:12px; color:var(--color-muted-foreground); }
+.upload-x { background:none; border:none; cursor:pointer; font-size:16px; color:var(--color-muted-foreground); }
+.result { margin-top:16px; line-height:1.6; }
+.result img { width:100%; border-radius:8px; margin:8px 0; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; font-size:12px; color:var(--color-muted-foreground); margin-top:8px; }
+.err { padding:12px; border-radius:8px; background:hsl(var(--destructive)/.1); color:hsl(var(--destructive)); font-size:13px; margin-top:8px; }
+.cursor-blink { display:inline-block; width:2px; height:16px; background:currentColor;
+  margin-left:2px; vertical-align:text-bottom; animation:blink .8s step-end infinite; }
+@keyframes blink { 50% { opacity:0; } }
+.b-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(90px,1fr)); gap:8px; margin-top:12px; }
+.b-thumb { position:relative; border-radius:8px; overflow:hidden; cursor:pointer; aspect-ratio:1; border:2px solid transparent; }
+.b-thumb.selected { border-color:hsl(var(--primary)); }
+.b-thumb img { width:100%; height:100%; object-fit:cover; }
+.b-overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:22px; pointer-events:none; }
+.b-ov-pending { background:rgba(0,0,0,.25); }
+.b-ov-running { background:rgba(0,0,0,.35); }
+.b-ov-done { background:rgba(0,180,0,.18); }
+.b-ov-failed { background:rgba(220,0,0,.22); }
+.b-remove { position:absolute; top:2px; right:2px; width:20px; height:20px; border-radius:50%;
+  background:rgba(0,0,0,.55); color:#fff; display:flex; align-items:center;
+  justify-content:center; font-size:13px; cursor:pointer; }
+.b-spin { width:22px; height:22px; border:3px solid rgba(255,255,255,.4);
+  border-top-color:#fff; border-radius:50%; animation:spin .7s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.b-drop { border:2px dashed var(--color-border); border-radius:12px; padding:32px;
+  text-align:center; cursor:pointer; transition:border-color .2s; }
+.b-drop.over { border-color:hsl(var(--primary)); background:hsl(var(--primary)/.05); }
+.b-drop input[type=file] { display:none; }
+.b-bar { height:6px; background:var(--color-border); border-radius:3px; overflow:hidden; margin-top:6px; }
+.b-bar-fill { height:100%; background:hsl(var(--primary)); transition:width .3s; border-radius:3px; }
+.b-bar-fill.has-fail { background:linear-gradient(90deg,hsl(var(--primary)) var(--ok-pct,0%),hsl(var(--destructive)) var(--ok-pct,0%)); }
+.b-progress-text { display:flex; justify-content:space-between; font-size:13px; color:var(--color-muted-foreground); }
+.b-compare-imgs { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:8px; }
+.b-compare-imgs img { width:100%; border-radius:8px; }
+.b-compare-label { font-size:12px; color:var(--color-muted-foreground); margin-bottom:4px; }
+.b-compare-title { font-weight:600; font-size:14px; }
+.b-compare-error { color:hsl(var(--destructive)); font-size:13px; margin-top:8px; }
+.b-compare-meta { font-size:12px; color:var(--color-muted-foreground); margin-top:6px; }
 """
 
-JS = """\
-let sid=localStorage.getItem('sid')||'',pastedFile=null;
-if(!sid){sid=crypto.randomUUID();localStorage.setItem('sid',sid);}
-let hasKey=false;
 
-/* ── API Key management ── */
+KEY_JS = """\
+let hasKey=false;
 function toggleKeyModal(){
-  document.getElementById('key-modal').classList.toggle('hide');
-  document.getElementById('key-msg').textContent='';
+  UIkit.modal(document.getElementById('key-modal')).toggle();
 }
 async function checkKey(){
   try{
     const r=await fetch('/api/key');const d=await r.json();
     const st=document.getElementById('key-status');
     if(d.has_key){
-      hasKey=true; st.textContent=d.masked; st.className='key-status active';
+      hasKey=true; st.textContent=d.masked; st.className='text-xs text-green-600 mr-1';
     }else{
-      hasKey=false; st.textContent='\u672a\u8bbe\u7f6e'; st.className='key-status';
+      hasKey=false; st.textContent='\u672a\u8bbe\u7f6e'; st.className='text-xs text-muted-foreground mr-1';
       toggleKeyModal();
     }
   }catch(e){console.error(e);}
 }
 async function saveKey(){
   const inp=document.getElementById('key-input'),msg=document.getElementById('key-msg');
-  const k=inp.value.trim(); if(!k){msg.textContent='\u8bf7\u8f93\u5165 Key';msg.className='key-msg err';return;}
-  msg.textContent='\u9a8c\u8bc1\u4e2d\u2026';msg.className='key-msg';
+  const k=inp.value.trim(); if(!k){msg.textContent='\u8bf7\u8f93\u5165 Key';msg.className='text-xs text-destructive mt-2';return;}
+  msg.textContent='\u9a8c\u8bc1\u4e2d\u2026';msg.className='text-xs text-muted-foreground mt-2';
   document.getElementById('key-save-btn').disabled=true;
   try{
     const r=await fetch('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k})});
     const d=await r.json();
     if(d.ok){
-      hasKey=true; msg.textContent='\u2705 \u5df2\u4fdd\u5b58';msg.className='key-msg ok';
+      hasKey=true; msg.textContent='\u2705 \u5df2\u4fdd\u5b58';msg.className='text-xs text-green-600 mt-2';
       document.getElementById('key-status').textContent=d.masked;
-      document.getElementById('key-status').className='key-status active';
+      document.getElementById('key-status').className='text-xs text-green-600 mr-1';
       inp.value='';
-      setTimeout(function(){document.getElementById('key-modal').classList.add('hide');},800);
-      newChat();
+      setTimeout(function(){UIkit.modal(document.getElementById('key-modal')).hide();},800);
     }else{
-      msg.textContent=d.error||'\u5931\u8d25';msg.className='key-msg err';
+      msg.textContent=d.error||'\u5931\u8d25';msg.className='text-xs text-destructive mt-2';
     }
-  }catch(e){msg.textContent='\u7f51\u7edc\u9519\u8bef';msg.className='key-msg err';}
+  }catch(e){msg.textContent='\u7f51\u7edc\u9519\u8bef';msg.className='text-xs text-destructive mt-2';}
   document.getElementById('key-save-btn').disabled=false;
 }
 async function clearKey(){
   await fetch('/api/key',{method:'DELETE'});
   hasKey=false;
   document.getElementById('key-status').textContent='\u672a\u8bbe\u7f6e';
-  document.getElementById('key-status').className='key-status';
-  document.getElementById('key-msg').textContent='\u5df2\u6e05\u9664';document.getElementById('key-msg').className='key-msg ok';
+  document.getElementById('key-status').className='text-xs text-muted-foreground mr-1';
+  document.getElementById('key-msg').textContent='\u5df2\u6e05\u9664';
+  document.getElementById('key-msg').className='text-xs text-green-600 mt-2';
   document.getElementById('key-input').value='';
 }
 checkKey();
+"""
+
+MAIN_JS = KEY_JS + """\
+let sid=localStorage.getItem('sid')||'',pastedFile=null;
+if(!sid){sid=crypto.randomUUID();localStorage.setItem('sid',sid);}
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function scrollM(){const m=document.getElementById('main');m.scrollTop=m.scrollHeight;}
@@ -268,7 +225,7 @@ async function go(){
   const fi=document.getElementById('file');
   if(pastedFile)fd.append('image',pastedFile,'pasted.png');
   else if(fi&&fi.files[0])fd.append('image',fi.files[0]);
-  btn.disabled=true;btn.innerHTML='<span class="spin"></span>\u751f\u6210\u4e2d\u2026';
+  btn.disabled=true;btn.innerHTML='<span uk-spinner="ratio:0.6"></span> \u751f\u6210\u4e2d\u2026';
   // Prepare result area
   const ra=document.getElementById('result-area');
   ra.innerHTML='<div class="result" id="cur-result"><span class="cursor-blink"></span></div>';
@@ -331,79 +288,86 @@ document.getElementById('prompt').addEventListener('keydown',function(e){
 });
 """
 
-app, rt = fast_app(hdrs=[Style(CSS)], live=False)
+
+# ── App setup ────────────────────────────────────────────────────────────
+app, rt = fast_app(
+    hdrs=Theme.blue.headers(mode='light') + [Style(EXTRA_CSS)],
+    live=False,
+)
+
+
+def key_modal():
+    """Shared API Key settings modal."""
+    return Modal(
+        P("\u5728 ", A("Google AI Studio", href="https://aistudio.google.com/apikey",
+                    target="_blank", cls="text-primary underline"),
+          " \u83b7\u53d6 Key", cls="text-sm text-muted-foreground"),
+        Input(type="password", id="key-input", placeholder="AIzaSy...",
+              cls="uk-input font-mono"),
+        Div(id="key-msg"),
+        header=H3("\u8bbe\u7f6e Gemini API Key", cls="text-lg font-semibold"),
+        footer=DivFullySpaced(
+            Button("\u6e05\u9664", cls=ButtonT.ghost, onclick="clearKey()"),
+            Button("\u4fdd\u5b58", cls=ButtonT.primary, onclick="saveKey()", id="key-save-btn"),
+        ),
+        id="key-modal",
+    )
+
+
+def page_header(title, *extra_buttons):
+    return DivFullySpaced(
+        H3(title, cls="font-bold"),
+        DivHStacked(
+            Span(id="key-status", cls="text-xs text-muted-foreground mr-1"),
+            Button(UkIcon('key', height=16), cls=ButtonT.ghost,
+                   onclick="toggleKeyModal()", title="\u8bbe\u7f6e API Key"),
+            *extra_buttons,
+        ),
+        cls="py-3",
+    )
 
 
 @rt("/")
 def get():
-    return Div(
-        Div(
-            H1("\u56fe\u7247\u5de5\u4f5c\u53f0"),
-            Div(
-                Span(id="key-status", cls="key-status"),
-                Button("\U0001f511", cls="nb key-btn", onclick="toggleKeyModal()", title="\u8bbe\u7f6e API Key"),
-                A("\u6279\u91cf", href="/batch", cls="nb", style="text-decoration:none;margin-right:8px"),
-                Button("\u65b0\u5bf9\u8bdd", cls="nb", onclick="newChat()"),
-            ),
-            cls="head"
+    return Container(
+        page_header(
+            "\u56fe\u7247\u5de5\u4f5c\u53f0",
+            A("\u6279\u91cf", href="/batch", cls="uk-btn uk-btn-default uk-btn-sm"),
+            Button("\u65b0\u5bf9\u8bdd", cls=(ButtonT.default, ButtonT.sm), onclick="newChat()"),
         ),
-        # API Key modal
-        Div(
+        Card(
+            Div(Div("\u65b0\u5bf9\u8bdd", cls="ctx-empty"), id="ctx-list"),
+            DividerLine(),
             Div(
-                H3("\u8bbe\u7f6e Gemini API Key"),
-                P("\u5728 ", A("Google AI Studio", href="https://aistudio.google.com/apikey", target="_blank"), " \u83b7\u53d6 Key", cls="key-hint"),
-                Input(type="password", id="key-input", placeholder="AIzaSy...", cls="key-field"),
-                Div(
-                    Button("\u4fdd\u5b58", cls="btn", onclick="saveKey()", id="key-save-btn"),
-                    Button("\u6e05\u9664", cls="nb", onclick="clearKey()", style="margin-left:8px"),
-                    Button("\u53d6\u6d88", cls="nb", onclick="toggleKeyModal()", style="margin-left:8px"),
-                    cls="key-actions"
-                ),
-                Div(id="key-msg", cls="key-msg"),
-                cls="key-box"
+                Img(src="", alt=""),
+                Span(cls="upload-name"),
+                Button("\u00d7", cls="upload-x", onclick="clearImage()"),
+                id="upload-preview", cls="upload-preview hide",
             ),
-            id="key-modal", cls="key-modal hide"
-        ),
-        Div(
-            # The envelope
-            Div(
-                Div("\u4e0a\u4e0b\u6587", cls="env-head"),
-                Div(
-                    Div("\u65b0\u5bf9\u8bdd", cls="ctx-empty"),
-                    id="ctx-list", cls="ctx-list"
-                ),
-                Div(cls="ctx-sep"),
-                # Upload preview (hidden by default)
-                Div(
-                    Img(src="", alt=""),
-                    Span(cls="upload-name"),
-                    Button("\u00d7", cls="upload-x", onclick="clearImage()"),
-                    id="upload-preview", cls="upload-preview hide"
-                ),
-                # Input
-                Div(
-                    Textarea(id="prompt", placeholder="\u63cf\u8ff0\u4f60\u60f3\u8981\u7684\u56fe\u7247\u2026"),
-                    cls="env-input"
-                ),
-                # Actions row: attach + submit
-                Div(
+            Textarea(id="prompt", placeholder="\u63cf\u8ff0\u4f60\u60f3\u8981\u7684\u56fe\u7247\u2026",
+                     cls="uk-textarea", rows=3),
+            header=P("\u4e0a\u4e0b\u6587", cls=TextPresets.muted_sm),
+            footer=Div(
+                DivFullySpaced(
                     Label(
-                        "\U0001f4ce \u4e0a\u4f20\u56fe\u7247",
-                        Input(type="file", id="file", accept="image/*", onchange="onFile(this)"),
-                        cls="attach"
+                        UkIcon('paperclip', height=16),
+                        " \u4e0a\u4f20\u56fe\u7247",
+                        Input(type="file", id="file", accept="image/*",
+                              onchange="onFile(this)", cls="hidden"),
+                        cls="cursor-pointer text-sm text-muted-foreground flex items-center gap-1",
                     ),
-                    Button("\u751f\u6210", id="btn", cls="btn", onclick="go()"),
-                    cls="env-actions"
+                    Button("\u751f\u6210", id="btn", cls=(ButtonT.primary, 'px-12'),
+                           onclick="go()"),
                 ),
-                Div(id="env-footer", cls="env-footer"),
-                cls="envelope"
+                Div(id="env-footer", cls="text-xs text-muted-foreground mt-2"),
             ),
-            # Result area
-            Div(id="result-area", cls="result-area"),
-            id="main", cls="main"
         ),
-        Script(JS),
-        cls="w"
+        Div(id="result-area", cls="mt-4"),
+        key_modal(),
+        Script(MAIN_JS),
+        cls=ContainerT.sm,
+        id="main",
+        style="display:flex;flex-direction:column;min-height:100vh;",
     )
 
 
@@ -415,34 +379,29 @@ def get_or_create_chat(sid: str, uid: str):
         sessions[sid] = client.chats.create(
             model=MODEL,
             config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="HIGH",
-                ),
+                thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
                 response_modalities=["TEXT", "IMAGE"]
             )
         )
     return sessions[sid]
 
 
-# ─── API Key management ───────────────────────────────────────────────
 @rt("/api/key", methods=["POST"])
 async def post_api_key(request):
     body = await request.json()
     key = (body.get("key") or "").strip()
     if not key:
-        return JSONResponse({"ok": False, "error": "Key 不能为空"})
+        return JSONResponse({"ok": False, "error": "Key \u4e0d\u80fd\u4e3a\u7a7a"})
     uid = request.cookies.get("uid", "")
     if not uid:
         uid = uuid.uuid4().hex[:16]
     try:
         c = genai.Client(api_key=key)
-        # Validate by listing models (lightweight call)
         c.models.get(model=f"models/{MODEL}")
     except Exception as e:
-        return JSONResponse({"ok": False, "error": f"Key 无效: {e}"})
+        return JSONResponse({"ok": False, "error": f"Key \u65e0\u6548: {e}"})
     api_keys[uid] = key
     clients[uid] = c
-    # Clear any existing sessions for this uid (new key = fresh start)
     to_del = [k for k in sessions if k.startswith(uid + "_")]
     for k in to_del:
         del sessions[k]
@@ -481,11 +440,11 @@ async def post_generate(request):
     sid = form.get("sid", "")
     uid = request.cookies.get("uid", "")
     if not prompt:
-        return StreamingResponse(iter([sse_event("error", "请输入描述")]), media_type="text/event-stream")
+        return StreamingResponse(iter([sse_event("error", "\u8bf7\u8f93\u5165\u63cf\u8ff0")]), media_type="text/event-stream")
     if not sid:
-        return StreamingResponse(iter([sse_event("error", "缺少会话")]), media_type="text/event-stream")
+        return StreamingResponse(iter([sse_event("error", "\u7f3a\u5c11\u4f1a\u8bdd")]), media_type="text/event-stream")
     if not get_client(uid):
-        return StreamingResponse(iter([sse_event("error", "请先设置 API Key")]), media_type="text/event-stream")
+        return StreamingResponse(iter([sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")]), media_type="text/event-stream")
 
     img_bytes = None
     img_ct = None
@@ -498,13 +457,12 @@ async def post_generate(request):
         try:
             chat = get_or_create_chat(sid, uid)
             if not chat:
-                yield sse_event("error", "请先设置 API Key")
+                yield sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")
                 return
             if img_bytes:
                 contents = [types.Part.from_bytes(data=img_bytes, mime_type=img_ct), prompt]
             else:
                 contents = prompt
-
             last_usage = None
             for chunk in chat.send_message_stream(contents):
                 if not chunk.candidates:
@@ -522,8 +480,6 @@ async def post_generate(request):
                 um = getattr(chunk, 'usage_metadata', None)
                 if um and um.prompt_token_count:
                     last_usage = um
-
-            # Meta
             if last_usage:
                 um = last_usage
                 inp_t = um.prompt_token_count or 0
@@ -541,12 +497,9 @@ async def post_generate(request):
                 parts.append(f'<span>\u5408\u8ba1 {um.total_token_count or 0} tokens</span>')
                 parts.append(f'<span>${cost:.4f}</span>')
                 yield sse_event("meta", ''.join(parts))
-
-            # Context
             ctx = build_context(sid)
             yield sse_event("context", json.dumps(ctx, ensure_ascii=False))
             yield "data: [DONE]\n\n"
-
         except Exception as e:
             traceback.print_exc()
             yield sse_event("error", f"\u9519\u8bef\uff1a{e}")
@@ -562,14 +515,12 @@ def get_generated(fname: str):
     return Response("Not found", status_code=404)
 
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 # BATCH MODE
 # ═══════════════════════════════════════════════════════════════════════════
 
 batch_pool = ThreadPoolExecutor(max_workers=3)
-batches: dict = {}          # batch_id -> {prompt, items: [...]}
-
+batches: dict = {}
 
 def _find_item(batch_id: str, item_id: str):
     batch = batches.get(batch_id)
@@ -580,35 +531,28 @@ def _find_item(batch_id: str, item_id: str):
             return batch, it
     return batch, None
 
-
 def process_batch_item(batch_id: str, item_id: str):
-    """Run in a worker thread – process one image with the shared prompt."""
     batch, item = _find_item(batch_id, item_id)
     if not item:
         return
-
     client = get_client(batch.get("uid", ""))
     if not client:
         item["status"] = "error"
-        item["error"] = "API Key 未设置"
+        item["error"] = "API Key \u672a\u8bbe\u7f6e"
         return
-
     item["status"] = "running"
     try:
         with open(item["src_path"], "rb") as f:
             img_bytes = f.read()
-
         response = client.models.generate_content(
             model=MODEL,
-            contents=[types.Part.from_bytes(data=img_bytes,
-                                            mime_type=item["src_mime"]),
+            contents=[types.Part.from_bytes(data=img_bytes, mime_type=item["src_mime"]),
                       batch["prompt"]],
             config=types.GenerateContentConfig(
                 thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
                 response_modalities=["TEXT", "IMAGE"],
             ),
         )
-
         result_url = None
         result_text = ""
         if response.candidates and response.candidates[0].content:
@@ -619,8 +563,6 @@ def process_batch_item(batch_id: str, item_id: str):
                     result_url = save_image(part.inline_data.data)
                 elif hasattr(part, "text") and part.text:
                     result_text += part.text
-
-        # cost
         cost = 0.0
         um = getattr(response, "usage_metadata", None)
         if um:
@@ -633,7 +575,6 @@ def process_batch_item(batch_id: str, item_id: str):
                     img_t = d.token_count or 0
             txt_out_t = out_t - img_t
             cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
-
         item["result_url"] = result_url
         item["result_text"] = result_text
         item["cost"] = cost
@@ -641,178 +582,14 @@ def process_batch_item(batch_id: str, item_id: str):
             item["status"] = "done"
         else:
             item["status"] = "failed"
-            item["error"] = item.get("error") or "模型未返回图片"
-
+            item["error"] = item.get("error") or "\u6a21\u578b\u672a\u8fd4\u56de\u56fe\u7247"
     except Exception as e:
         traceback.print_exc()
         item["status"] = "failed"
         item["error"] = str(e)[:300]
 
 
-BATCH_CSS = """\
-/* ── batch page ── */
-.b-section { margin-bottom: 14px; }
-.b-section textarea {
-  width: 100%; min-height: 72px; padding: 10px 12px;
-  border: 1.5px solid var(--bd); border-radius: 8px;
-  font-size: 14px; font-family: inherit; color: var(--fg);
-  background: var(--bg); resize: vertical; outline: none;
-}
-.b-section textarea:focus { border-color: #999; }
-.b-section textarea::placeholder { color: var(--lg); }
-.b-drop {
-  position: relative; border: 2px dashed var(--bd); border-radius: 10px;
-  padding: 32px 16px; text-align: center; cursor: pointer;
-  margin-bottom: 14px; transition: border-color .2s, background .2s;
-}
-.b-drop.over { border-color: var(--fg); background: #fafafa; }
-.b-drop input[type=file] {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-  opacity: 0; cursor: pointer;
-}
-.b-drop-text { font-size: 13px; color: var(--lg); pointer-events: none; }
-.b-drop-text em { font-style: normal; font-size: 28px; display: block; margin-bottom: 6px; }
-.b-grid {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
-  margin-bottom: 14px;
-}
-.b-thumb {
-  position: relative; aspect-ratio: 1; border-radius: 6px;
-  overflow: hidden; cursor: pointer; background: #f5f5f5;
-}
-.b-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.b-thumb .b-overlay {
-  position: absolute; inset: 0; display: flex; align-items: center;
-  justify-content: center; font-size: 22px; transition: background .3s;
-  pointer-events: none;
-}
-.b-thumb .b-remove {
-  position: absolute; top: 2px; right: 2px; width: 20px; height: 20px;
-  border-radius: 50%; background: rgba(0,0,0,.55); color: #fff;
-  font-size: 13px; line-height: 20px; text-align: center; cursor: pointer;
-  display: none; pointer-events: auto;
-}
-.b-thumb:hover .b-remove { display: block; }
-.b-thumb.selected { outline: 2.5px solid var(--fg); outline-offset: -2.5px; }
-.b-ov-pending  { background: rgba(0,0,0,.25); }
-.b-ov-running  { background: rgba(0,0,0,.35); }
-.b-ov-done     { background: rgba(0,180,0,.18); }
-.b-ov-failed   { background: rgba(200,0,0,.28); }
-.b-spin {
-  display: inline-block; width: 22px; height: 22px;
-  border: 2.5px solid rgba(255,255,255,.35); border-top-color: #fff;
-  border-radius: 50%; animation: r .6s linear infinite;
-}
-.b-controls { margin-bottom: 14px; }
-.b-estimate {
-  font-size: 13px; color: var(--mg); margin-bottom: 10px; text-align: center;
-}
-.b-start { width: 100%; }
-.b-progress { margin-bottom: 16px; }
-.b-progress-text {
-  font-size: 13px; color: var(--mg); margin-bottom: 6px;
-  display: flex; justify-content: space-between;
-}
-.b-bar {
-  height: 6px; background: #eee; border-radius: 3px; overflow: hidden;
-}
-.b-bar-fill {
-  height: 100%; width: 0; background: var(--fg); border-radius: 3px;
-  transition: width .4s ease;
-}
-.b-bar-fill.has-fail {
-  background: linear-gradient(90deg, var(--fg) var(--ok-pct), #e74c3c var(--ok-pct));
-}
-.b-compare {
-  border: 1.5px solid var(--bd); border-radius: 10px;
-  padding: 14px; margin-bottom: 14px;
-}
-.b-compare-title {
-  font-size: 12px; color: var(--lg); margin-bottom: 10px; text-align: center;
-}
-.b-compare-imgs {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-  margin-bottom: 8px;
-}
-.b-compare-col { text-align: center; }
-.b-compare-label {
-  font-size: 11px; color: var(--lg); margin-bottom: 4px;
-}
-.b-compare-col img {
-  width: 100%; border-radius: 6px; display: block;
-  background: #f5f5f5; min-height: 60px;
-}
-.b-compare-meta {
-  font-size: 11px; color: var(--lg); text-align: center; margin-bottom: 6px;
-}
-.b-compare-error {
-  font-size: 13px; color: #b91c1c; background: #fef2f2;
-  padding: 8px 10px; border-radius: 6px; margin-bottom: 8px; text-align: center;
-}
-.b-retry-btn {
-  display: block; margin: 0 auto; padding: 6px 20px;
-  font-size: 13px; font-family: inherit;
-  background: none; border: 1.5px solid var(--bd); border-radius: 6px;
-  cursor: pointer; color: var(--fg);
-}
-.b-retry-btn:hover { border-color: var(--fg); }
-.b-done { margin-bottom: 20px; }
-.b-dl { width: 100%; }
-.head a.nb { text-decoration: none; }
-"""
-
-BATCH_JS = """\
-let bFiles=[], batchId=null, pollTimer=null, bItems=[], selIdx=-1, bStarted=false;
-const COST_EST=0.07;
-let hasKey=false;
-
-/* \u2500\u2500 API Key management \u2500\u2500 */
-function toggleKeyModal(){
-  document.getElementById('key-modal').classList.toggle('hide');
-  document.getElementById('key-msg').textContent='';
-}
-async function checkKey(){
-  try{
-    const r=await fetch('/api/key');const d=await r.json();
-    const st=document.getElementById('key-status');
-    if(d.has_key){
-      hasKey=true; st.textContent=d.masked; st.className='key-status active';
-    }else{
-      hasKey=false; st.textContent='\u672a\u8bbe\u7f6e'; st.className='key-status';
-      toggleKeyModal();
-    }
-  }catch(e){console.error(e);}
-}
-async function saveKey(){
-  const inp=document.getElementById('key-input'),msg=document.getElementById('key-msg');
-  const k=inp.value.trim(); if(!k){msg.textContent='\u8bf7\u8f93\u5165 Key';msg.className='key-msg err';return;}
-  msg.textContent='\u9a8c\u8bc1\u4e2d\u2026';msg.className='key-msg';
-  document.getElementById('key-save-btn').disabled=true;
-  try{
-    const r=await fetch('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k})});
-    const d=await r.json();
-    if(d.ok){
-      hasKey=true; msg.textContent='\u2705 \u5df2\u4fdd\u5b58';msg.className='key-msg ok';
-      document.getElementById('key-status').textContent=d.masked;
-      document.getElementById('key-status').className='key-status active';
-      inp.value='';
-      setTimeout(function(){document.getElementById('key-modal').classList.add('hide');},800);
-    }else{
-      msg.textContent=d.error||'\u5931\u8d25';msg.className='key-msg err';
-    }
-  }catch(e){msg.textContent='\u7f51\u7edc\u9519\u8bef';msg.className='key-msg err';}
-  document.getElementById('key-save-btn').disabled=false;
-}
-async function clearKey(){
-  await fetch('/api/key',{method:'DELETE'});
-  hasKey=false;
-  document.getElementById('key-status').textContent='\u672a\u8bbe\u7f6e';
-  document.getElementById('key-status').className='key-status';
-  document.getElementById('key-msg').textContent='\u5df2\u6e05\u9664';document.getElementById('key-msg').className='key-msg ok';
-  document.getElementById('key-input').value='';
-}
-checkKey();
-
+BATCH_JS_BODY = """\
 /* ── file handling ── */
 function addFiles(fileList){
   if(bStarted)return;
@@ -870,7 +647,7 @@ async function startBatch(){
   if(!prompt){alert('请输入提示词');return;}
   if(bFiles.length===0){alert('请上传图片');return;}
   const btn=document.getElementById('b-start');
-  btn.disabled=true; btn.innerHTML='<span class="spin"></span>上传中…';
+  btn.disabled=true; btn.innerHTML='<span uk-spinner="ratio:0.6"></span> 上传中…';
   const fd=new FormData();
   fd.append('prompt',prompt);
   bFiles.forEach(function(bf){fd.append('images',bf.file);});
@@ -993,95 +770,65 @@ function downloadZip(){
 }
 """
 
+BATCH_JS = KEY_JS + BATCH_JS_BODY
+
 
 @rt("/batch")
 def get_batch():
-    return Div(
-        Div(
-            H1("\u6279\u91cf\u5904\u7406"),
-            Div(
-                Span(id="key-status", cls="key-status"),
-                Button("\U0001f511", cls="nb key-btn", onclick="toggleKeyModal()", title="\u8bbe\u7f6e API Key"),
-                A("\u2190 \u5355\u5f20\u6a21\u5f0f", href="/", cls="nb"),
-            ),
-            cls="head",
+    return Container(
+        page_header(
+            "\u6279\u91cf\u5904\u7406",
+            A("\u2190 \u5355\u5f20\u6a21\u5f0f", href="/", cls="uk-btn uk-btn-default uk-btn-sm"),
         ),
-        # API Key modal
-        Div(
-            Div(
-                H3("\u8bbe\u7f6e Gemini API Key"),
-                P("\u5728 ", A("Google AI Studio", href="https://aistudio.google.com/apikey", target="_blank"), " \u83b7\u53d6 Key", cls="key-hint"),
-                Input(type="password", id="key-input", placeholder="AIzaSy...", cls="key-field"),
-                Div(
-                    Button("\u4fdd\u5b58", cls="btn", onclick="saveKey()", id="key-save-btn"),
-                    Button("\u6e05\u9664", cls="nb", onclick="clearKey()", style="margin-left:8px"),
-                    Button("\u53d6\u6d88", cls="nb", onclick="toggleKeyModal()", style="margin-left:8px"),
-                    cls="key-actions"
-                ),
-                Div(id="key-msg", cls="key-msg"),
-                cls="key-box"
-            ),
-            id="key-modal", cls="key-modal hide"
+        Card(
+            Textarea(id="b-prompt",
+                     placeholder="\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u5c06\u5e94\u7528\u5230\u6240\u6709\u56fe\u7247\u2026",
+                     cls="uk-textarea", rows=3),
         ),
         Div(
-            # prompt
-            Div(
-                Textarea(id="b-prompt",
-                         placeholder="\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u5c06\u5e94\u7528\u5230\u6240\u6709\u56fe\u7247\u2026"),
-                cls="b-section",
+            Input(type="file", id="b-files", multiple=True, accept="image/*"),
+            DivCentered(
+                UkIcon('upload', height=32, cls="text-muted-foreground"),
+                P("\u62d6\u62fd\u6216\u70b9\u51fb\u4e0a\u4f20\u56fe\u7247\uff08\u652f\u6301\u591a\u9009\uff09",
+                  cls="text-sm text-muted-foreground"),
             ),
-            # drop zone
-            Div(
-                Input(type="file", id="b-files", multiple=True, accept="image/*"),
-                Div(NotStr("<em>\U0001F4C1</em>\u62d6\u62fd\u6216\u70b9\u51fb\u4e0a\u4f20\u56fe\u7247\uff08\u652f\u6301\u591a\u9009\uff09"), cls="b-drop-text"),
-                id="b-drop", cls="b-drop",
-            ),
-            # thumbnail grid
-            Div(id="b-grid", cls="b-grid"),
-            # controls
-            Div(
-                Div(id="b-estimate", cls="b-estimate"),
-                Button("\u5f00\u59cb\u5904\u7406", id="b-start", cls="btn b-start", onclick="startBatch()"),
-                id="b-controls", cls="b-controls", style="display:none",
-            ),
-            # progress
-            Div(
-                Div(id="b-progress-text", cls="b-progress-text"),
-                Div(Div(id="b-bar-fill", cls="b-bar-fill"), cls="b-bar"),
-                id="b-progress", cls="b-progress", style="display:none",
-            ),
-            # comparison panel
-            Div(
-                Div(id="b-compare-title", cls="b-compare-title"),
-                Div(
-                    Div(
-                        Div("\u539f\u56fe", cls="b-compare-label"),
-                        Img(id="b-cmp-src", src=""),
-                        cls="b-compare-col",
-                    ),
-                    Div(
-                        Div("\u7ed3\u679c", cls="b-compare-label"),
-                        Img(id="b-cmp-res", src=""),
-                        cls="b-compare-col",
-                    ),
-                    cls="b-compare-imgs",
-                ),
-                Div(id="b-compare-error", cls="b-compare-error", style="display:none"),
-                Div(id="b-compare-meta", cls="b-compare-meta"),
-                Button("\u91cd\u8bd5", id="b-retry-btn", cls="b-retry-btn",
-                       style="display:none", onclick="retrySelected()"),
-                id="b-compare", cls="b-compare", style="display:none",
-            ),
-            # download
-            Div(
-                Button("\u6253\u5305\u4e0b\u8f7d", cls="btn b-dl", onclick="downloadZip()"),
-                id="b-done", cls="b-done", style="display:none",
-            ),
-            id="main", cls="main",
+            id="b-drop", cls="b-drop",
         ),
-        Style(BATCH_CSS),
+        Div(id="b-grid", cls="b-grid"),
+        Div(
+            DivFullySpaced(
+                Span(id="b-estimate", cls="text-sm text-muted-foreground"),
+                Button("\u5f00\u59cb\u5904\u7406", id="b-start", cls=ButtonT.primary,
+                       onclick="startBatch()"),
+            ),
+            id="b-controls", style="display:none",
+        ),
+        Div(
+            Div(id="b-progress-text", cls="b-progress-text"),
+            Div(Div(id="b-bar-fill", cls="b-bar-fill"), cls="b-bar"),
+            id="b-progress", style="display:none",
+        ),
+        Card(
+            Div(id="b-compare-title", cls="b-compare-title"),
+            Div(
+                Div(Div("\u539f\u56fe", cls="b-compare-label"), Img(id="b-cmp-src", src="")),
+                Div(Div("\u7ed3\u679c", cls="b-compare-label"), Img(id="b-cmp-res", src="")),
+                cls="b-compare-imgs",
+            ),
+            Div(id="b-compare-error", cls="b-compare-error", style="display:none"),
+            Div(id="b-compare-meta", cls="b-compare-meta"),
+            Button("\u91cd\u8bd5", id="b-retry-btn", cls=ButtonT.destructive,
+                   style="display:none", onclick="retrySelected()"),
+            id="b-compare", style="display:none",
+        ),
+        Div(
+            Button(UkIcon('download', height=16), " \u6253\u5305\u4e0b\u8f7d",
+                   cls=ButtonT.primary, onclick="downloadZip()"),
+            id="b-done", cls="mt-4", style="display:none",
+        ),
+        key_modal(),
         Script(BATCH_JS),
-        cls="w",
+        cls=(ContainerT.sm, 'space-y-4'),
     )
 
 
@@ -1094,14 +841,11 @@ async def post_batch_start(request):
         return JSONResponse({"error": "\u8bf7\u5148\u8bbe\u7f6e API Key"}, status_code=400)
     if not prompt:
         return JSONResponse({"error": "\u8bf7\u8f93\u5165\u63d0\u793a\u8bcd"}, status_code=400)
-
     raw_images = form.getlist("images")
     if not raw_images:
         return JSONResponse({"error": "\u8bf7\u4e0a\u4f20\u56fe\u7247"}, status_code=400)
-
     batch_id = uuid.uuid4().hex[:12]
     items = []
-
     for upload in raw_images:
         if not hasattr(upload, "read"):
             continue
@@ -1113,25 +857,15 @@ async def post_batch_start(request):
         src_path = os.path.join(GEN_DIR, os.path.basename(src_url))
         mime = getattr(upload, "content_type", None) or "image/png"
         items.append({
-            "id":          item_id,
-            "status":      "pending",
-            "src_url":     src_url,
-            "src_path":    src_path,
-            "src_mime":    mime,
-            "result_url":  None,
-            "result_text": None,
-            "error":       None,
-            "cost":        0.0,
+            "id": item_id, "status": "pending",
+            "src_url": src_url, "src_path": src_path, "src_mime": mime,
+            "result_url": None, "result_text": None, "error": None, "cost": 0.0,
         })
-
     if not items:
         return JSONResponse({"error": "\u672a\u68c0\u6d4b\u5230\u6709\u6548\u56fe\u7247"}, status_code=400)
-
     batches[batch_id] = {"prompt": prompt, "items": items, "uid": uid}
-
     for item in items:
         batch_pool.submit(process_batch_item, batch_id, item["id"])
-
     return JSONResponse({"batch_id": batch_id})
 
 
@@ -1140,35 +874,24 @@ def get_batch_status(batch_id: str):
     batch = batches.get(batch_id)
     if not batch:
         return JSONResponse({"error": "\u6279\u6b21\u4e0d\u5b58\u5728"}, status_code=404)
-
     items_out = []
     total = len(batch["items"])
     done = failed = running = 0
     cost = 0.0
-
     for it in batch["items"]:
         s = it["status"]
-        if s == "done":    done += 1
+        if s == "done": done += 1
         elif s == "failed": failed += 1
         elif s == "running": running += 1
-        cost += it["cost"]
+        cost += it.get("cost", 0.0)
         items_out.append({
-            "id":          it["id"],
-            "status":      it["status"],
-            "src_url":     it["src_url"],
-            "result_url":  it["result_url"],
-            "result_text": it["result_text"],
-            "error":       it["error"],
-            "cost":        it["cost"],
+            "id": it["id"], "status": s, "src_url": it["src_url"],
+            "result_url": it.get("result_url"), "result_text": it.get("result_text"),
+            "error": it.get("error"), "cost": it.get("cost", 0.0),
         })
-
     return JSONResponse({
-        "total":   total,
-        "done":    done,
-        "failed":  failed,
-        "running": running,
-        "cost":    round(cost, 6),
-        "items":   items_out,
+        "total": total, "done": done, "failed": failed, "running": running,
+        "cost": cost, "items": items_out,
     })
 
 
@@ -1176,10 +899,9 @@ def get_batch_status(batch_id: str):
 def post_batch_retry(batch_id: str, item_id: str):
     batch, item = _find_item(batch_id, item_id)
     if not item:
-        return JSONResponse({"error": "\u672a\u627e\u5230"}, status_code=404)
-    if item["status"] not in ("failed",):
-        return JSONResponse({"error": "\u72b6\u6001\u4e0d\u5141\u8bb8\u91cd\u8bd5"}, status_code=400)
-
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if item["status"] not in ("failed", "error"):
+        return JSONResponse({"error": "not failed"}, status_code=400)
     item["status"] = "pending"
     item["error"] = None
     item["result_url"] = None
@@ -1193,30 +915,19 @@ def post_batch_retry(batch_id: str, item_id: str):
 def get_batch_download(batch_id: str):
     batch = batches.get(batch_id)
     if not batch:
-        return Response("\u6279\u6b21\u4e0d\u5b58\u5728", status_code=404)
-
+        return Response("Not found", status_code=404)
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        idx = 0
-        for it in batch["items"]:
-            if it["status"] != "done" or not it["result_url"]:
-                continue
-            idx += 1
-            fname = os.path.basename(it["result_url"])
-            fpath = os.path.join(GEN_DIR, fname)
-            if os.path.exists(fpath):
-                ext = os.path.splitext(fname)[1] or ".jpg"
-                zf.write(fpath, f"result_{idx:03d}{ext}")
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for i, it in enumerate(batch["items"]):
+            if it["status"] == "done" and it.get("result_url"):
+                fpath = os.path.join(GEN_DIR, os.path.basename(it["result_url"]))
+                if os.path.exists(fpath):
+                    zf.write(fpath, f"result_{i+1}.jpg")
     buf.seek(0)
-
-    return Response(
-        content=buf.getvalue(),
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="batch_{batch_id}.zip"'
-        },
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=batch_{batch_id}.zip"},
     )
-
 
 
 serve(host="0.0.0.0", port=8000)
