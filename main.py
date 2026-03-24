@@ -1,7 +1,8 @@
-import uuid, os, traceback
+import uuid, os, traceback, json, threading
 from fasthtml.common import *
 from google import genai
 from google.genai import types
+from starlette.responses import StreamingResponse
 
 API_KEY = "REDACTED_GOOGLE_API_KEY"
 MODEL = "gemini-3.1-flash-image-preview"
@@ -10,6 +11,8 @@ os.makedirs(GEN_DIR, exist_ok=True)
 
 gclient = genai.Client(api_key=API_KEY)
 sessions: dict = {}
+# Store pending tasks: task_id -> {contents, sid}
+pending: dict = {}
 
 CSS = """\
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -56,6 +59,9 @@ textarea::placeholder { color: var(--lg); }
 .think summary { font-size: 11px; color: var(--lg); cursor: pointer; }
 .think summary:hover { color: var(--mg); }
 .think pre { font-size: 12px; color: var(--mg); line-height: 1.5; white-space: pre-wrap; margin-top: 4px; font-family: inherit; }
+.streaming-text { display: inline; }
+.cursor-blink { display: inline-block; width: 2px; height: 14px; background: var(--fg); margin-left: 2px; vertical-align: text-bottom; animation: blink 0.8s step-end infinite; }
+@keyframes blink { 50% { opacity: 0; } }
 """
 
 JS = """\
@@ -104,6 +110,7 @@ document.addEventListener('paste',function(e){
     }
   }
 });
+function scrollH(){const h=document.getElementById('history');h.scrollTop=h.scrollHeight;}
 async function go(){
   const btn=document.getElementById('btn'),p=document.getElementById('prompt').value.trim();
   if(!p)return;
@@ -114,20 +121,79 @@ async function go(){
     else if(f&&f.files[0])fd.append('image',f.files[0]);
   }
   btn.disabled=true;btn.innerHTML='<span class="spin"></span>\u751f\u6210\u4e2d\u2026';
+  // Add user turn
+  const h=document.getElementById('history');
+  const ut=document.createElement('div');ut.className='turn';
+  ut.innerHTML='<div class="role">\u4f60</div><div class="bubble user-text">'+p.replace(/</g,'&lt;')+'</div>';
+  h.appendChild(ut);
+  // Add model turn (will be filled by stream)
+  const mt=document.createElement('div');mt.className='turn';
+  mt.innerHTML='<div class="role">\u6a21\u578b</div><div class="bubble" id="stream-bubble"><span class="cursor-blink"></span></div>';
+  h.appendChild(mt);
+  scrollH();
   try{
     const r=await fetch('/generate',{method:'POST',body:fd});
-    const html=await r.text();
-    const h=document.getElementById('history');
-    const ut=document.createElement('div');ut.className='turn';
-    ut.innerHTML='<div class="role">\u4f60</div><div class="bubble user-text">'+p.replace(/</g,'&lt;')+'</div>';
-    h.appendChild(ut);
-    const mt=document.createElement('div');mt.className='turn';
-    mt.innerHTML='<div class="role">\u6a21\u578b</div><div class="bubble">'+html+'</div>';
-    h.appendChild(mt);
+    const reader=r.body.getReader();
+    const decoder=new TextDecoder();
+    let buf='';
+    const bubble=document.getElementById('stream-bubble');
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buf+=decoder.decode(value,{stream:true});
+      // Parse SSE lines
+      let lines=buf.split(String.fromCharCode(10));
+      buf=lines.pop();
+      for(const line of lines){
+        if(!line.startsWith('data: '))continue;
+        const raw=line.slice(6);
+        if(raw==='[DONE]')continue;
+        let ev;
+        try{ev=JSON.parse(raw);}catch(e){continue;}
+        if(ev.type==='text'){
+          // Remove cursor, append text, re-add cursor
+          const cur=bubble.querySelector('.cursor-blink');
+          const span=document.createElement('span');
+          span.className='streaming-text';
+          span.textContent=ev.data;
+          if(cur)bubble.insertBefore(span,cur);
+          else bubble.appendChild(span);
+          scrollH();
+        }else if(ev.type==='image'){
+          const cur=bubble.querySelector('.cursor-blink');
+          const img=document.createElement('img');
+          img.src=ev.data;
+          img.alt='result';
+          if(cur)bubble.insertBefore(img,cur);
+          else bubble.appendChild(img);
+          scrollH();
+        }else if(ev.type==='meta'){
+          const cur=bubble.querySelector('.cursor-blink');
+          if(cur)cur.remove();
+          const d=document.createElement('div');
+          d.className='meta';
+          d.innerHTML=ev.data;
+          bubble.appendChild(d);
+        }else if(ev.type==='error'){
+          const cur=bubble.querySelector('.cursor-blink');
+          if(cur)cur.remove();
+          bubble.innerHTML='<div class="err">'+ev.data+'</div>';
+        }
+      }
+    }
+    // Remove cursor if still there
+    const cur=bubble.querySelector('.cursor-blink');
+    if(cur)cur.remove();
+    // Remove the temp id
+    bubble.removeAttribute('id');
+    // Add divider
     const dv=document.createElement('div');dv.className='divider';h.appendChild(dv);
     document.getElementById('prompt').value='';pastedFile=null;
-    const hd=document.getElementById('history');hd.scrollTop=hd.scrollHeight;
-  }catch(e){alert(e.message);}
+    scrollH();
+  }catch(e){
+    const bubble=document.getElementById('stream-bubble');
+    if(bubble)bubble.innerHTML='<div class="err">'+e.message+'</div>';
+  }
   finally{btn.disabled=false;btn.textContent=mode==='gen'?'\u751f\u6210':'\u7f16\u8f91';}
 }
 document.getElementById('prompt').addEventListener('keydown',function(e){
@@ -188,6 +254,11 @@ def get_or_create_chat(sid: str):
     return sessions[sid]
 
 
+def sse_event(etype: str, data: str) -> str:
+    """Format a single SSE event."""
+    return f"data: {json.dumps({'type': etype, 'data': data}, ensure_ascii=False)}\n\n"
+
+
 @rt("/generate", methods=["POST"])
 async def post_generate(request):
     form = await request.form()
@@ -195,80 +266,83 @@ async def post_generate(request):
     mode = form.get("mode", "gen")
     sid = form.get("sid", "")
     if not prompt:
-        return Div("\u8bf7\u8f93\u5165\u63cf\u8ff0", cls="err")
+        return StreamingResponse(
+            iter([sse_event("error", "\u8bf7\u8f93\u5165\u63cf\u8ff0")]),
+            media_type="text/event-stream"
+        )
     if not sid:
-        return Div("\u7f3a\u5c11\u4f1a\u8bdd", cls="err")
+        return StreamingResponse(
+            iter([sse_event("error", "\u7f3a\u5c11\u4f1a\u8bdd")]),
+            media_type="text/event-stream"
+        )
 
-    try:
-        chat = get_or_create_chat(sid)
+    # Read upload if present
+    img_bytes = None
+    img_ct = None
+    if mode == "edit":
+        upload = form.get("image")
+        if upload and hasattr(upload, 'read'):
+            img_bytes = await upload.read()
+            img_ct = upload.content_type or "image/png"
 
-        if mode == "edit":
-            upload = form.get("image")
-            if upload and hasattr(upload, 'read'):
-                img_bytes = await upload.read()
-                ct = upload.content_type or "image/png"
-                contents = [types.Part.from_bytes(data=img_bytes, mime_type=ct), prompt]
+    def stream_gen():
+        try:
+            chat = get_or_create_chat(sid)
+
+            if mode == "edit" and img_bytes:
+                contents = [types.Part.from_bytes(data=img_bytes, mime_type=img_ct), prompt]
             else:
                 contents = prompt
-        else:
-            contents = prompt
 
-        response = chat.send_message(contents)
+            last_usage = None
+            for chunk in chat.send_message_stream(contents):
+                if not chunk.candidates:
+                    continue
+                cand = chunk.candidates[0]
+                if cand.content and cand.content.parts:
+                    for part in cand.content.parts:
+                        # Skip thought parts
+                        if getattr(part, 'thought', False):
+                            continue
+                        if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                            fname = f"{uuid.uuid4().hex}.png"
+                            fpath = os.path.join(GEN_DIR, fname)
+                            with open(fpath, 'wb') as f:
+                                f.write(part.inline_data.data)
+                            yield sse_event("image", f"/generated/{fname}")
+                        elif hasattr(part, 'text') and part.text:
+                            yield sse_event("text", part.text)
+                # Track usage from each chunk (last one with data wins)
+                um = getattr(chunk, 'usage_metadata', None)
+                if um and um.prompt_token_count:
+                    last_usage = um
 
-        parts = []
-        # Collect thinking text
-        think_text = ""
-        for part in response.candidates[0].content.parts:
-            if getattr(part, 'thought', False) and part.text:
-                think_text += part.text
-                continue
-            if hasattr(part, 'inline_data') and part.inline_data:
-                fname = f"{uuid.uuid4().hex}.png"
-                with open(os.path.join(GEN_DIR, fname), 'wb') as f:
-                    f.write(part.inline_data.data)
-                parts.append(Img(src=f"/generated/{fname}", alt="result"))
-            if hasattr(part, 'text') and part.text:
-                parts.append(P(part.text))
+            # Send usage/cost meta
+            if last_usage:
+                um = last_usage
+                inp_t = um.prompt_token_count or 0
+                out_t = um.candidates_token_count or 0
+                think_t = um.thoughts_token_count or 0
+                img_t = 0
+                for d in (um.candidates_tokens_details or []):
+                    if d.modality and d.modality.value == 'IMAGE':
+                        img_t = d.token_count or 0
+                txt_out_t = out_t - img_t
+                cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
+                parts = [f'<span>\u8f93\u5165 {inp_t}</span>', f'<span>\u8f93\u51fa {out_t}</span>']
+                if think_t:
+                    parts.append(f'<span>\u601d\u7ef4 {think_t}</span>')
+                parts.append(f'<span>\u5408\u8ba1 {um.total_token_count or 0} tokens</span>')
+                parts.append(f'<span>${cost:.4f}</span>')
+                yield sse_event("meta", ''.join(parts))
 
-        # Thinking block
-        if think_text:
-            parts.append(Details(
-                Summary("\u601d\u7ef4\u8fc7\u7a0b"),
-                Pre(think_text),
-                cls="think"
-            ))
+            yield "data: [DONE]\n\n"
 
-        # Usage & cost
-        um = getattr(response, 'usage_metadata', None)
-        if um:
-            inp_t = um.prompt_token_count or 0
-            out_t = um.candidates_token_count or 0
-            think_t = um.thoughts_token_count or 0
-            # Separate image tokens from text tokens in output
-            img_t = 0
-            for d in (um.candidates_tokens_details or []):
-                if d.modality and d.modality.value == 'IMAGE':
-                    img_t = d.token_count or 0
-            txt_out_t = out_t - img_t
-            # Pricing: input $0.50/1M, output text+thinking $3/1M, output image $60/1M
-            cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
-            meta_parts = [
-                Span(f"\u8f93\u5165 {inp_t}"),
-                Span(f"\u8f93\u51fa {out_t}"),
-            ]
-            if think_t:
-                meta_parts.append(Span(f"\u601d\u7ef4 {think_t}"))
-            meta_parts.append(Span(f"\u5408\u8ba1 {um.total_token_count or 0} tokens"))
-            meta_parts.append(Span(f"${cost:.4f}"))
-            parts.append(Div(*meta_parts, cls="meta"))
+        except Exception as e:
+            traceback.print_exc()
+            yield sse_event("error", f"\u9519\u8bef\uff1a{e}")
 
-        if parts:
-            return Div(*parts)
-        return Div("\u672a\u751f\u6210\u5185\u5bb9\uff0c\u8bf7\u6362\u4e2a\u63cf\u8ff0\u8bd5\u8bd5", cls="err")
-
-    except Exception as e:
-        traceback.print_exc()
-        return Div(f"\u9519\u8bef\uff1a{e}", cls="err")
+    return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
 
 @rt("/generated/{fname}")
