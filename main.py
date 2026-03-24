@@ -169,6 +169,9 @@ def get_or_create_chat(sid: str):
         sessions[sid] = gclient.chats.create(
             model=MODEL,
             config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="HIGH",
+                ),
                 response_modalities=["TEXT", "IMAGE"]
             )
         )
