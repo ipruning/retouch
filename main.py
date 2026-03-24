@@ -537,7 +537,7 @@ def process_batch_item(batch_id: str, item_id: str):
         return
     client = get_client(batch.get("uid", ""))
     if not client:
-        item["status"] = "error"
+        item["status"] = "failed"
         item["error"] = "API Key \u672a\u8bbe\u7f6e"
         return
     item["status"] = "running"
@@ -590,6 +590,8 @@ def process_batch_item(batch_id: str, item_id: str):
 
 
 BATCH_JS_BODY = """\
+let bFiles=[], bStarted=false, bItems=[], batchId=null, selIdx=-1, pollTimer=null;
+const COST_EST=0.05;
 /* ── file handling ── */
 function addFiles(fileList){
   if(bStarted)return;
