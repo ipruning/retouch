@@ -55,6 +55,11 @@ textarea::placeholder { color: var(--lg); }
 @keyframes r { to { transform: rotate(360deg); } }
 .meta { font-size: 11px; color: var(--lg); margin-top: 8px; line-height: 1.6; }
 .meta span { margin-right: 10px; }
+.ctx { font-size: 11px; color: var(--lg); text-align: center; padding: 4px 0; margin-bottom: 10px; }
+.ctx-detail { font-size: 11px; color: var(--lg); background: #f9f9f9; border-radius: 6px; padding: 8px 12px; margin-bottom: 14px; line-height: 1.8; }
+.ctx-detail .ctx-turn { display: flex; align-items: baseline; gap: 6px; }
+.ctx-detail .ctx-role { color: var(--mg); font-weight: 500; min-width: 28px; }
+.ctx-detail .ctx-parts { color: var(--lg); }
 .think { margin-top: 8px; }
 .think summary { font-size: 11px; color: var(--lg); cursor: pointer; }
 .think summary:hover { color: var(--mg); }
@@ -174,6 +179,23 @@ async function go(){
           d.className='meta';
           d.innerHTML=ev.data;
           bubble.appendChild(d);
+        }else if(ev.type==='context'){
+          const cur=bubble.querySelector('.cursor-blink');
+          if(cur)cur.remove();
+          try{
+            const ctx=JSON.parse(ev.data);
+            let html='<div class="ctx-detail"><div style="margin-bottom:4px;color:#555">';
+            html+='\u4e0a\u4e0b\u6587 '+ctx.turns.length+'\u8f6e';
+            if(ctx.total_bytes>0)html+='\uff0c\u7ea6 '+(ctx.total_bytes/1024/1024).toFixed(1)+'MB \u56fe\u7247\u6570\u636e';
+            html+='</div>';
+            ctx.turns.forEach(function(t){
+              html+='<div class="ctx-turn"><span class="ctx-role">'+t.role+'</span><span class="ctx-parts">'+t.parts.join(' + ')+'</span></div>';
+            });
+            html+='</div>';
+            const d=document.createElement('div');
+            d.innerHTML=html;
+            bubble.appendChild(d.firstChild);
+          }catch(e){}
         }else if(ev.type==='error'){
           const cur=bubble.querySelector('.cursor-blink');
           if(cur)cur.remove();
@@ -336,6 +358,27 @@ async def post_generate(request):
                 parts.append(f'<span>${cost:.4f}</span>')
                 yield sse_event("meta", ''.join(parts))
 
+            # Send context info
+            history = chat.get_history(curated=True)
+            ctx_turns = []
+            ctx_bytes = 0
+            for content in history:
+                role = content.role or "?"
+                parts_desc = []
+                for p in (content.parts or []):
+                    if hasattr(p, 'inline_data') and p.inline_data and p.inline_data.data:
+                        size = len(p.inline_data.data)
+                        ctx_bytes += size
+                        parts_desc.append(f"\u56fe\u7247 {size//1024}KB")
+                    elif hasattr(p, 'text') and p.text and not getattr(p, 'thought', False):
+                        txt = p.text
+                        preview = (txt[:30] + "\u2026") if len(txt) > 30 else txt
+                        parts_desc.append(preview)
+                if parts_desc:
+                    ctx_turns.append({"role": "\u4f60" if role == "user" else "\u6a21\u578b", "parts": parts_desc})
+            ctx_data = json.dumps({"turns": ctx_turns, "total_bytes": ctx_bytes}, ensure_ascii=False)
+            yield sse_event("context", ctx_data)
+
             yield "data: [DONE]\n\n"
 
         except Exception as e:
@@ -343,6 +386,37 @@ async def post_generate(request):
             yield sse_event("error", f"\u9519\u8bef\uff1a{e}")
 
     return StreamingResponse(stream_gen(), media_type="text/event-stream")
+
+
+@rt("/context/{sid}")
+def get_context(sid: str):
+    """Return the current chat context structure for display."""
+    if sid not in sessions:
+        return Response(json.dumps({"turns": [], "total_bytes": 0}), media_type="application/json")
+    chat = sessions[sid]
+    history = chat.get_history(curated=True)
+    turns = []
+    total_bytes = 0
+    for content in history:
+        role = content.role or "?"
+        parts_desc = []
+        for p in (content.parts or []):
+            if hasattr(p, 'inline_data') and p.inline_data and p.inline_data.data:
+                size = len(p.inline_data.data)
+                total_bytes += size
+                parts_desc.append(f"\u56fe\u7247 {size//1024}KB")
+            elif hasattr(p, 'text') and p.text and not getattr(p, 'thought', False):
+                t = p.text
+                preview = (t[:40] + "\u2026") if len(t) > 40 else t
+                parts_desc.append(preview)
+            elif getattr(p, 'thought_signature', None):
+                total_bytes += len(p.thought_signature)
+        if parts_desc:
+            turns.append({"role": "\u4f60" if role == "user" else "\u6a21\u578b", "parts": parts_desc})
+    return Response(
+        json.dumps({"turns": turns, "total_bytes": total_bytes, "turn_count": len(turns)}, ensure_ascii=False),
+        media_type="application/json"
+    )
 
 
 @rt("/generated/{fname}")
