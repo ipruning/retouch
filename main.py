@@ -39,6 +39,8 @@ textarea::placeholder { color: var(--lg); }
 .drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 .drop .name { color: var(--fg); }
 .thumb { margin-top: 10px; max-width: 72px; max-height: 72px; border-radius: 4px; }
+.paste-hint { font-size: 11px; color: var(--lg); margin-top: 6px; }
+.drop.has-img { border-style: solid; border-color: #999; }
 
 .btn { display: block; width: 100%; padding: 10px; background: var(--fg); color: #fff; border: none; border-radius: 6px; font-size: 14px; font-weight: 500; cursor: pointer; transition: opacity .15s; }
 .btn:hover { opacity: .85; }
@@ -62,6 +64,7 @@ textarea::placeholder { color: var(--lg); }
 
 JS = """\
 let mode='gen', sid=localStorage.getItem('sid')||'';
+let pastedFile=null;
 if(!sid){ sid=crypto.randomUUID(); localStorage.setItem('sid',sid); }
 
 function sw(m){
@@ -71,28 +74,66 @@ function sw(m){
   document.getElementById('upload').className=m==='edit'?'field':'hide';
   document.getElementById('btn').textContent=m==='gen'?'Generate':'Edit';
 }
-function pv(el){
+function showPreview(file, label){
   const t=document.getElementById('thumb'); t.innerHTML='';
   const d=document.getElementById('dropzone');
-  if(el.files[0]){
-    d.innerHTML='<span class="name">'+el.files[0].name+'</span>';
-    d.appendChild(el);
-    const img=document.createElement('img'); img.className='thumb';
-    const r=new FileReader(); r.onload=e=>{img.src=e.target.result;t.appendChild(img);}; r.readAsDataURL(el.files[0]);
-  }
+  d.innerHTML='<span class="name">'+label+'</span>';
+  // Re-add the file input
+  const inp=document.createElement('input');
+  inp.type='file'; inp.id='file'; inp.accept='image/*';
+  inp.onchange=function(){pastedFile=null; pv(this);};
+  d.appendChild(inp);
+  d.classList.add('has-img');
+  const img=document.createElement('img'); img.className='thumb';
+  const r=new FileReader(); r.onload=e=>{img.src=e.target.result;t.appendChild(img);}; r.readAsDataURL(file);
+}
+function pv(el){
+  pastedFile=null;
+  if(el.files[0]) showPreview(el.files[0], el.files[0].name);
+}
+function clearImage(){
+  pastedFile=null;
+  const t=document.getElementById('thumb'); t.innerHTML='';
+  const d=document.getElementById('dropzone');
+  d.classList.remove('has-img');
+  d.innerHTML='Drop, upload, or ⌘V paste an image';
+  const inp=document.createElement('input');
+  inp.type='file'; inp.id='file'; inp.accept='image/*';
+  inp.onchange=function(){pastedFile=null; pv(this);};
+  d.appendChild(inp);
 }
 function newChat(){
   sid=crypto.randomUUID(); localStorage.setItem('sid',sid);
   document.getElementById('history').innerHTML='';
   document.getElementById('prompt').value='';
-  const t=document.getElementById('thumb'); t.innerHTML='';
+  clearImage();
 }
+// Paste handler
+document.addEventListener('paste', function(e){
+  const items=e.clipboardData&&e.clipboardData.items;
+  if(!items) return;
+  for(let i=0;i<items.length;i++){
+    if(items[i].type.indexOf('image')!==-1){
+      e.preventDefault();
+      const blob=items[i].getAsFile();
+      if(!blob) return;
+      pastedFile=blob;
+      // Auto-switch to Edit mode
+      sw('edit');
+      showPreview(blob, 'Pasted image');
+      return;
+    }
+  }
+});
 async function go(){
   const btn=document.getElementById('btn'), p=document.getElementById('prompt').value.trim();
   if(!p){alert('Enter a prompt');return;}
   const fd=new FormData(); fd.append('prompt',p); fd.append('mode',mode); fd.append('sid',sid);
   const f=document.getElementById('file');
-  if(mode==='edit'&&f&&f.files[0]) fd.append('image',f.files[0]);
+  if(mode==='edit'){
+    if(pastedFile) fd.append('image',pastedFile,'pasted.png');
+    else if(f&&f.files[0]) fd.append('image',f.files[0]);
+  }
   btn.disabled=true; btn.innerHTML='<span class="spin"></span>Working...';
   try{
     const r=await fetch('/generate',{method:'POST',body:fd});
@@ -109,6 +150,8 @@ async function go(){
     // Add divider
     const dv=document.createElement('div'); dv.className='divider'; hist.appendChild(dv);
     document.getElementById('prompt').value='';
+    // Clear pasted image after use
+    pastedFile=null;
     window.scrollTo(0,document.body.scrollHeight);
   } catch(e){ alert('Error: '+e.message); }
   finally{ btn.disabled=false; btn.textContent=mode==='gen'?'Generate':'Edit'; }
@@ -135,7 +178,7 @@ def get():
         Div(
             Label("Reference image"),
             Div(
-                "Drop an image or click to upload",
+                "Drop, upload, or \u2318V paste an image",
                 Input(type="file", id="file", accept="image/*", onchange="pv(this)"),
                 id="dropzone", cls="drop"
             ),
