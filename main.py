@@ -561,14 +561,10 @@ async def post_api_key(request):
             test_c = OpenAI(
                 api_key=key,
                 base_url="https://api.apiyi.com/v1",
-                timeout=httpx.Timeout(30.0, connect=10.0),
+                timeout=httpx.Timeout(15.0, connect=10.0),
             )
-            # Quick validation
-            test_c.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "hi"}],
-                max_tokens=5,
-            )
+            # Validate key by listing models (lightweight, no billing)
+            test_c.models.list()
         except Exception as e:
             return JSONResponse({"ok": False, "error": f"Key \u65e0\u6548: {e}"})
         # Store client with long timeout for image generation
