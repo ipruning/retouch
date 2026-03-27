@@ -1,5 +1,8 @@
-import uuid, os, traceback, json, hashlib, zipfile, io, threading, time, base64, re
+import uuid, os, traceback, json, hashlib, zipfile, io, threading, time, base64, re, logging
 from concurrent.futures import ThreadPoolExecutor
+
+log = logging.getLogger('imageapp')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 from fasthtml.common import *
 from monsterui.all import *
 from google import genai
@@ -588,7 +591,7 @@ async def post_api_key(request):
             api_key=key,
             base_url="https://api.apiyi.com/v1",
             timeout=httpx.Timeout(300.0, connect=30.0),
-            max_retries=2,
+            max_retries=0,
         )
         clients.pop(uid, None)  # clear google client if any
     else:
@@ -874,11 +877,19 @@ def process_batch_item(batch_id: str, item_id: str):
             img_bytes = f.read()
 
         if prov == "apiyi":
-            # OpenAI-compatible path
-            oai = get_oai_client(uid)
+            # OpenAI-compatible path — create fresh client per thread for thread safety
+            key = api_keys.get(uid, "")
             model = get_user_model(uid)
+            oai = OpenAI(
+                api_key=key,
+                base_url="https://api.apiyi.com/v1",
+                timeout=httpx.Timeout(300.0, connect=30.0),
+                max_retries=0,
+            )
             b64 = base64.b64encode(img_bytes).decode()
             mime = item["src_mime"] or "image/png"
+            log.info(f"Batch {batch_id}/{item_id}: calling Apiyi model={model} img_size={len(img_bytes)/1024:.0f}KB b64_size={len(b64)/1024:.0f}KB")
+            t0 = time.time()
             r = oai.chat.completions.create(
                 model=model,
                 messages=[{
@@ -888,9 +899,10 @@ def process_batch_item(batch_id: str, item_id: str):
                         {"type": "text", "text": batch["prompt"]},
                     ]
                 }],
-                timeout=httpx.Timeout(300.0, connect=30.0),
             )
+            elapsed = time.time() - t0
             content = r.choices[0].message.content or ""
+            log.info(f"Batch {batch_id}/{item_id}: got response in {elapsed:.1f}s, content_len={len(content)}")
             result_url = None
             result_text = ""
             parsed = parse_oai_image_response(content)
@@ -898,7 +910,15 @@ def process_batch_item(batch_id: str, item_id: str):
                 if ptype == "image" and not result_url:
                     result_url = save_image(pdata)
                 elif ptype == "image_url" and not result_url:
-                    result_url = pdata  # external URL as-is
+                    # Try once more to download
+                    try:
+                        dl = httpx.get(pdata, timeout=30, follow_redirects=True)
+                        if dl.status_code == 200 and len(dl.content) > 100:
+                            result_url = save_image(dl.content)
+                        else:
+                            result_url = pdata
+                    except Exception:
+                        result_url = pdata
                 elif ptype == "text":
                     result_text += pdata
             cost = 0.0
@@ -950,6 +970,7 @@ def process_batch_item(batch_id: str, item_id: str):
             item["status"] = "failed"
             item["error"] = item.get("error") or "\u6a21\u578b\u672a\u8fd4\u56de\u56fe\u7247"
     except Exception as e:
+        log.error(f"Batch {batch_id}/{item_id}: error: {e}")
         traceback.print_exc()
         item["status"] = "failed"
         item["error"] = str(e)[:300]
@@ -1278,9 +1299,10 @@ def get_batch_status(batch_id: str):
             "result_url": it.get("result_url"), "result_text": it.get("result_text"),
             "error": it.get("error"), "cost": it.get("cost", 0.0),
         })
+    finished = batch.get("finished") is not None
     return JSONResponse({
         "total": total, "done": done, "failed": failed, "running": running,
-        "cost": cost, "items": items_out,
+        "cost": cost, "finished": finished, "items": items_out,
     })
 
 
