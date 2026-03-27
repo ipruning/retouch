@@ -24,11 +24,9 @@ PROVIDERS = {
     "apiyi": {
         "name": "Apiyi 代理",
         "models": [
-            ("gemini-3.1-flash-image-preview", "Gemini 3.1 Flash Image"),
+            ("gemini-2.5-flash-image", "Gemini 2.5 Flash Image"),
             ("gemini-3-pro-image-preview", "Gemini 3 Pro Image"),
             ("nano-banana-pro", "Nano Banana Pro"),
-            ("nano-banana-2", "Nano Banana 2"),
-            ("nano-banana", "Nano Banana"),
         ],
     },
 }
@@ -56,20 +54,39 @@ def get_user_model(uid: str) -> str:
 
 def parse_oai_image_response(content: str):
     """Parse OpenAI-compatible response that contains markdown image(s).
-    Returns list of (type, data) tuples: ('image', bytes) or ('text', str).
+    Returns list of (type, data) tuples:
+      ('image', bytes)    — base64-decoded inline image
+      ('image_url', str)  — external URL (e.g. OSS)
+      ('text', str)       — plain text
+    Supports both data:image base64 and https:// URL formats.
     """
+    # Match both: ![image](data:image/...;base64,...) and ![image](https://...)
+    IMG_RE = re.compile(r'!\[(?:image)?\]\(([^)]+)\)')
     parts = []
     last_end = 0
-    for m in re.finditer(r'!\[image\]\(data:image/[^;]+;base64,([A-Za-z0-9+/=]+)\)', content):
-        # Text before this image
+    for m in IMG_RE.finditer(content):
         text_before = content[last_end:m.start()].strip()
         if text_before:
             parts.append(('text', text_before))
-        try:
-            img_data = base64.b64decode(m.group(1))
-            parts.append(('image', img_data))
-        except Exception:
-            pass
+        src = m.group(1)
+        if src.startswith('data:image/'):
+            # Inline base64
+            try:
+                b64 = src.split(',', 1)[1]
+                img_data = base64.b64decode(b64)
+                parts.append(('image', img_data))
+            except Exception:
+                pass
+        elif src.startswith('http://') or src.startswith('https://'):
+            # External URL — download it
+            try:
+                resp = httpx.get(src, timeout=30, follow_redirects=True)
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    parts.append(('image', resp.content))
+                else:
+                    parts.append(('image_url', src))
+            except Exception:
+                parts.append(('image_url', src))
         last_end = m.end()
     # Remaining text
     text_after = content[last_end:].strip()
@@ -184,11 +201,9 @@ const providerModels={
     ['gemini-3-pro-image-preview','Gemini 3 Pro Image'],
   ],
   apiyi:[
-    ['gemini-3.1-flash-image-preview','Gemini 3.1 Flash Image'],
+    ['gemini-2.5-flash-image','Gemini 2.5 Flash Image'],
     ['gemini-3-pro-image-preview','Gemini 3 Pro Image'],
     ['nano-banana-pro','Nano Banana Pro'],
-    ['nano-banana-2','Nano Banana 2'],
-    ['nano-banana','Nano Banana'],
   ]
 };
 function toggleKeyModal(){
@@ -691,6 +706,8 @@ async def post_generate(request):
                     if ptype == "image":
                         url = save_image(pdata)
                         yield sse_event("image", url)
+                    elif ptype == "image_url":
+                        yield sse_event("image", pdata)
                     elif ptype == "text":
                         yield sse_event("text", pdata)
 
@@ -879,6 +896,8 @@ def process_batch_item(batch_id: str, item_id: str):
             for ptype, pdata in parsed:
                 if ptype == "image" and not result_url:
                     result_url = save_image(pdata)
+                elif ptype == "image_url" and not result_url:
+                    result_url = pdata  # external URL as-is
                 elif ptype == "text":
                     result_text += pdata
             cost = 0.0
