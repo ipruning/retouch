@@ -425,6 +425,7 @@ document.getElementById('prompt').addEventListener('keydown',function(e){
 # ── App setup ────────────────────────────────────────────────────────────
 app, rt = fast_app(
     hdrs=Theme.blue.headers(mode='light') + [Style(EXTRA_CSS)],
+    title='图片工作台',
     live=False,
 )
 
