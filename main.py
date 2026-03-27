@@ -1,21 +1,81 @@
-import uuid, os, traceback, json, hashlib, zipfile, io, threading, time
+import uuid, os, traceback, json, hashlib, zipfile, io, threading, time, base64, re
 from concurrent.futures import ThreadPoolExecutor
 from fasthtml.common import *
 from monsterui.all import *
 from google import genai
 from google.genai import types
+import httpx
+from openai import OpenAI
 from starlette.responses import StreamingResponse
 
-MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
 GEN_DIR = "generated"
 os.makedirs(GEN_DIR, exist_ok=True)
 
-api_keys: dict = {}
-clients: dict = {}
-sessions: dict = {}
+# Available providers and their models
+PROVIDERS = {
+    "google": {
+        "name": "Google 官方",
+        "models": [
+            ("gemini-3.1-flash-image-preview", "Gemini 3.1 Flash Image"),
+            ("gemini-3-pro-image-preview", "Gemini 3 Pro Image"),
+        ],
+    },
+    "apiyi": {
+        "name": "Apiyi 代理",
+        "models": [
+            ("gemini-3.1-flash-image-preview", "Gemini 3.1 Flash Image"),
+            ("gemini-3-pro-image-preview", "Gemini 3 Pro Image"),
+            ("nano-banana-pro", "Nano Banana Pro"),
+            ("nano-banana-2", "Nano Banana 2"),
+            ("nano-banana", "Nano Banana"),
+        ],
+    },
+}
+
+api_keys: dict = {}     # uid -> key
+clients: dict = {}      # uid -> google genai Client (google provider)
+oai_clients: dict = {}  # uid -> OpenAI Client (apiyi provider)
+providers: dict = {}    # uid -> "google" | "apiyi"
+user_models: dict = {}  # uid -> selected model name
+sessions: dict = {}     # sid -> google chat session
 
 def get_client(uid: str):
+    """Return google genai client if google provider."""
     return clients.get(uid)
+
+def get_oai_client(uid: str):
+    """Return OpenAI client if apiyi provider."""
+    return oai_clients.get(uid)
+
+def get_provider(uid: str) -> str:
+    return providers.get(uid, "google")
+
+def get_user_model(uid: str) -> str:
+    return user_models.get(uid, DEFAULT_MODEL)
+
+def parse_oai_image_response(content: str):
+    """Parse OpenAI-compatible response that contains markdown image(s).
+    Returns list of (type, data) tuples: ('image', bytes) or ('text', str).
+    """
+    parts = []
+    last_end = 0
+    for m in re.finditer(r'!\[image\]\(data:image/[^;]+;base64,([A-Za-z0-9+/=]+)\)', content):
+        # Text before this image
+        text_before = content[last_end:m.start()].strip()
+        if text_before:
+            parts.append(('text', text_before))
+        try:
+            img_data = base64.b64decode(m.group(1))
+            parts.append(('image', img_data))
+        except Exception:
+            pass
+        last_end = m.end()
+    # Remaining text
+    text_after = content[last_end:].strip()
+    if text_after:
+        parts.append(('text', text_after))
+    return parts
 
 def save_image(data: bytes) -> str:
     h = hashlib.md5(data).hexdigest()
@@ -117,18 +177,54 @@ EXTRA_CSS = """\
 
 
 KEY_JS = """\
-let hasKey=false;
+let hasKey=false, curProvider='google', curModel='';
+const providerModels={
+  google:[
+    ['gemini-3.1-flash-image-preview','Gemini 3.1 Flash Image'],
+    ['gemini-3-pro-image-preview','Gemini 3 Pro Image'],
+  ],
+  apiyi:[
+    ['gemini-3.1-flash-image-preview','Gemini 3.1 Flash Image'],
+    ['gemini-3-pro-image-preview','Gemini 3 Pro Image'],
+    ['nano-banana-pro','Nano Banana Pro'],
+    ['nano-banana-2','Nano Banana 2'],
+    ['nano-banana','Nano Banana'],
+  ]
+};
 function toggleKeyModal(){
   UIkit.modal(document.getElementById('key-modal')).toggle();
+}
+function onProviderChange(sel){
+  const p=sel.value;
+  const mSel=document.getElementById('model-select');
+  mSel.innerHTML='';
+  (providerModels[p]||[]).forEach(function(m){
+    const o=document.createElement('option');
+    o.value=m[0]; o.textContent=m[1];
+    mSel.appendChild(o);
+  });
+  // Update placeholder hint
+  const inp=document.getElementById('key-input');
+  if(p==='google') inp.placeholder='AIzaSy...';
+  else inp.placeholder='sk-...';
 }
 async function checkKey(){
   try{
     const r=await fetch('/api/key');const d=await r.json();
     const st=document.getElementById('key-status');
     if(d.has_key){
-      hasKey=true; st.textContent=d.masked; st.className='text-xs text-green-600 mr-1';
+      hasKey=true;
+      curProvider=d.provider||'google';
+      curModel=d.model||'';
+      const label=(d.provider==='apiyi'?'Apiyi':'Google')+' '+d.masked;
+      st.textContent=label; st.className='text-xs text-green-600 mr-1';
+      // Update model indicator
+      const mi=document.getElementById('model-indicator');
+      if(mi) mi.textContent=d.model_label||curModel;
     }else{
       hasKey=false; st.textContent='\u672a\u8bbe\u7f6e'; st.className='text-xs text-muted-foreground mr-1';
+      const mi=document.getElementById('model-indicator');
+      if(mi) mi.textContent='';
       toggleKeyModal();
     }
   }catch(e){console.error(e);}
@@ -136,15 +232,22 @@ async function checkKey(){
 async function saveKey(){
   const inp=document.getElementById('key-input'),msg=document.getElementById('key-msg');
   const k=inp.value.trim(); if(!k){msg.textContent='\u8bf7\u8f93\u5165 Key';msg.className='text-xs text-destructive mt-2';return;}
+  const provider=document.getElementById('provider-select').value;
+  const model=document.getElementById('model-select').value;
   msg.textContent='\u9a8c\u8bc1\u4e2d\u2026';msg.className='text-xs text-muted-foreground mt-2';
   document.getElementById('key-save-btn').disabled=true;
   try{
-    const r=await fetch('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k})});
+    const r=await fetch('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:k,provider:provider,model:model})});
     const d=await r.json();
     if(d.ok){
-      hasKey=true; msg.textContent='\u2705 \u5df2\u4fdd\u5b58';msg.className='text-xs text-green-600 mt-2';
-      document.getElementById('key-status').textContent=d.masked;
+      hasKey=true; curProvider=provider; curModel=model;
+      msg.textContent='\u2705 \u5df2\u4fdd\u5b58';msg.className='text-xs text-green-600 mt-2';
+      const label=(provider==='apiyi'?'Apiyi':'Google')+' '+d.masked;
+      document.getElementById('key-status').textContent=label;
       document.getElementById('key-status').className='text-xs text-green-600 mr-1';
+      const mi=document.getElementById('model-indicator');
+      if(mi) mi.textContent=d.model_label||model;
       inp.value='';
       setTimeout(function(){UIkit.modal(document.getElementById('key-modal')).hide();},800);
     }else{
@@ -155,12 +258,14 @@ async function saveKey(){
 }
 async function clearKey(){
   await fetch('/api/key',{method:'DELETE'});
-  hasKey=false;
+  hasKey=false; curProvider='google'; curModel='';
   document.getElementById('key-status').textContent='\u672a\u8bbe\u7f6e';
   document.getElementById('key-status').className='text-xs text-muted-foreground mr-1';
   document.getElementById('key-msg').textContent='\u5df2\u6e05\u9664';
   document.getElementById('key-msg').className='text-xs text-green-600 mt-2';
   document.getElementById('key-input').value='';
+  const mi=document.getElementById('model-indicator');
+  if(mi) mi.textContent='';
 }
 checkKey();
 """
@@ -310,15 +415,36 @@ app, rt = fast_app(
 
 
 def key_modal():
-    """Shared API Key settings modal."""
+    """Shared API Key settings modal with provider/model selection."""
     return Modal(
+        Div(
+            Label("\u63d0\u4f9b\u5546", cls="text-sm font-medium"),
+            Select(
+                Option("Google \u5b98\u65b9", value="google", selected=True),
+                Option("Apiyi \u4ee3\u7406", value="apiyi"),
+                id="provider-select", cls="uk-select",
+                onchange="onProviderChange(this)",
+            ),
+            cls="mb-3",
+        ),
+        Div(
+            Label("\u6a21\u578b", cls="text-sm font-medium"),
+            Select(
+                Option("Gemini 3.1 Flash Image", value="gemini-3.1-flash-image-preview", selected=True),
+                Option("Gemini 3 Pro Image", value="gemini-3-pro-image-preview"),
+                id="model-select", cls="uk-select",
+            ),
+            cls="mb-3",
+        ),
         P("\u5728 ", A("Google AI Studio", href="https://aistudio.google.com/apikey",
+                    target="_blank", cls="text-primary underline"),
+          " \u6216 ", A("Apiyi", href="https://api.apiyi.com",
                     target="_blank", cls="text-primary underline"),
           " \u83b7\u53d6 Key", cls="text-sm text-muted-foreground"),
         Input(type="password", id="key-input", placeholder="AIzaSy...",
               cls="uk-input font-mono"),
         Div(id="key-msg"),
-        header=H3("\u8bbe\u7f6e Gemini API Key", cls="text-lg font-semibold"),
+        header=H3("\u8bbe\u7f6e API Key", cls="text-lg font-semibold"),
         footer=DivFullySpaced(
             Button("\u6e05\u9664", cls=ButtonT.ghost, onclick="clearKey()"),
             Button("\u4fdd\u5b58", cls=ButtonT.primary, onclick="saveKey()", id="key-save-btn"),
@@ -330,7 +456,11 @@ def key_modal():
 def page_header(title, *extra_buttons):
     return Div(
         Div(
-            H3(title, cls="font-bold text-lg sm:text-xl whitespace-nowrap"),
+            Div(
+                H3(title, cls="font-bold text-lg sm:text-xl whitespace-nowrap"),
+                Span(id="model-indicator", cls="text-xs text-muted-foreground"),
+                cls="flex items-center gap-2",
+            ),
             Div(
                 Span(id="key-status", cls="text-xs text-muted-foreground"),
                 Button(UkIcon('key', height=16), cls=ButtonT.ghost,
@@ -388,12 +518,14 @@ def get():
 
 
 def get_or_create_chat(sid: str, uid: str):
+    """Create/get a Google genai chat session. Only for google provider."""
     client = get_client(uid)
     if not client:
         return None
+    model = get_user_model(uid)
     if sid not in sessions:
         sessions[sid] = client.chats.create(
-            model=MODEL,
+            model=model,
             config=types.GenerateContentConfig(
                 thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
                 response_modalities=["TEXT", "IMAGE"]
@@ -401,27 +533,72 @@ def get_or_create_chat(sid: str, uid: str):
         )
     return sessions[sid]
 
+def has_any_client(uid: str) -> bool:
+    """Check if user has any configured client."""
+    return uid in clients or uid in oai_clients
+
 
 @rt("/api/key", methods=["POST"])
 async def post_api_key(request):
     body = await request.json()
     key = (body.get("key") or "").strip()
+    provider = (body.get("provider") or "google").strip()
+    model = (body.get("model") or DEFAULT_MODEL).strip()
     if not key:
         return JSONResponse({"ok": False, "error": "Key \u4e0d\u80fd\u4e3a\u7a7a"})
     uid = request.cookies.get("uid", "")
     if not uid:
         uid = uuid.uuid4().hex[:16]
-    try:
-        c = genai.Client(api_key=key)
-        c.models.get(model=f"models/{MODEL}")
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"Key \u65e0\u6548: {e}"})
+
+    # Find model label
+    model_label = model
+    for mid, mlbl in PROVIDERS.get(provider, {}).get("models", []):
+        if mid == model:
+            model_label = mlbl
+            break
+
+    if provider == "apiyi":
+        # Validate via OpenAI-compatible API
+        try:
+            test_c = OpenAI(
+                api_key=key,
+                base_url="https://api.apiyi.com/v1",
+                timeout=httpx.Timeout(30.0, connect=10.0),
+            )
+            # Quick validation
+            test_c.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=5,
+            )
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"Key \u65e0\u6548: {e}"})
+        # Store client with long timeout for image generation
+        oai_clients[uid] = OpenAI(
+            api_key=key,
+            base_url="https://api.apiyi.com/v1",
+            timeout=httpx.Timeout(300.0, connect=30.0),
+            max_retries=2,
+        )
+        clients.pop(uid, None)  # clear google client if any
+    else:
+        # Google official
+        try:
+            c = genai.Client(api_key=key)
+            c.models.get(model=f"models/{model}")
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"Key \u65e0\u6548: {e}"})
+        clients[uid] = c
+        oai_clients.pop(uid, None)  # clear apiyi client if any
+
     api_keys[uid] = key
-    clients[uid] = c
+    providers[uid] = provider
+    user_models[uid] = model
+    # Clear sessions on key change
     to_del = [k for k in sessions if k.startswith(uid + "_")]
     for k in to_del:
         del sessions[k]
-    resp = JSONResponse({"ok": True, "masked": key[:6] + "..." + key[-4:]})
+    resp = JSONResponse({"ok": True, "masked": key[:6] + "..." + key[-4:], "model_label": model_label})
     resp.set_cookie("uid", uid, max_age=86400*365, httponly=True, samesite="lax")
     return resp
 
@@ -430,7 +607,15 @@ def get_api_key(request):
     uid = request.cookies.get("uid", "")
     if uid and uid in api_keys:
         k = api_keys[uid]
-        return JSONResponse({"has_key": True, "masked": k[:6] + "..." + k[-4:]})
+        prov = get_provider(uid)
+        model = get_user_model(uid)
+        model_label = model
+        for mid, mlbl in PROVIDERS.get(prov, {}).get("models", []):
+            if mid == model:
+                model_label = mlbl
+                break
+        return JSONResponse({"has_key": True, "masked": k[:6] + "..." + k[-4:],
+                             "provider": prov, "model": model, "model_label": model_label})
     return JSONResponse({"has_key": False})
 
 @rt("/api/key", methods=["DELETE"])
@@ -439,6 +624,9 @@ def delete_api_key(request):
     if uid:
         api_keys.pop(uid, None)
         clients.pop(uid, None)
+        oai_clients.pop(uid, None)
+        providers.pop(uid, None)
+        user_models.pop(uid, None)
         to_del = [k for k in sessions if k.startswith(uid + "_")]
         for k in to_del:
             del sessions[k]
@@ -459,7 +647,7 @@ async def post_generate(request):
         return StreamingResponse(iter([sse_event("error", "\u8bf7\u8f93\u5165\u63cf\u8ff0")]), media_type="text/event-stream")
     if not sid:
         return StreamingResponse(iter([sse_event("error", "\u7f3a\u5c11\u4f1a\u8bdd")]), media_type="text/event-stream")
-    if not get_client(uid):
+    if not has_any_client(uid):
         return StreamingResponse(iter([sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")]), media_type="text/event-stream")
 
     img_bytes = None
@@ -469,58 +657,128 @@ async def post_generate(request):
         img_bytes = await upload.read()
         img_ct = upload.content_type or "image/png"
 
-    def stream_gen():
-        try:
-            chat = get_or_create_chat(sid, uid)
-            if not chat:
-                yield sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")
-                return
-            if img_bytes:
-                contents = [types.Part.from_bytes(data=img_bytes, mime_type=img_ct), prompt]
-            else:
-                contents = prompt
-            last_usage = None
-            for chunk in chat.send_message_stream(contents):
-                if not chunk.candidates:
-                    continue
-                cand = chunk.candidates[0]
-                if cand.content and cand.content.parts:
-                    for part in cand.content.parts:
-                        if getattr(part, 'thought', False):
-                            continue
-                        if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
-                            url = save_image(part.inline_data.data)
-                            yield sse_event("image", url)
-                        elif hasattr(part, 'text') and part.text:
-                            yield sse_event("text", part.text)
-                um = getattr(chunk, 'usage_metadata', None)
-                if um and um.prompt_token_count:
-                    last_usage = um
-            if last_usage:
-                um = last_usage
-                inp_t = um.prompt_token_count or 0
-                out_t = um.candidates_token_count or 0
-                think_t = um.thoughts_token_count or 0
-                img_t = 0
-                for d in (um.candidates_tokens_details or []):
-                    if d.modality and d.modality.value == 'IMAGE':
-                        img_t = d.token_count or 0
-                txt_out_t = out_t - img_t
-                cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
-                parts = [f'<span>\u8f93\u5165 {inp_t}</span>', f'<span>\u8f93\u51fa {out_t}</span>']
-                if think_t:
-                    parts.append(f'<span>\u601d\u7ef4 {think_t}</span>')
-                parts.append(f'<span>\u5408\u8ba1 {um.total_token_count or 0} tokens</span>')
-                parts.append(f'<span>${cost:.4f}</span>')
-                yield sse_event("meta", ''.join(parts))
-            ctx = build_context(sid)
-            yield sse_event("context", json.dumps(ctx, ensure_ascii=False))
-            yield "data: [DONE]\n\n"
-        except Exception as e:
-            traceback.print_exc()
-            yield sse_event("error", f"\u9519\u8bef\uff1a{e}")
+    prov = get_provider(uid)
 
-    return StreamingResponse(stream_gen(), media_type="text/event-stream")
+    if prov == "apiyi":
+        # OpenAI-compatible path (non-streaming, parse markdown images)
+        def stream_oai():
+            try:
+                oai = get_oai_client(uid)
+                if not oai:
+                    yield sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")
+                    return
+                model = get_user_model(uid)
+                # Build message content
+                content_parts = []
+                if img_bytes:
+                    b64 = base64.b64encode(img_bytes).decode()
+                    mime = img_ct or "image/png"
+                    content_parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                content_parts.append({"type": "text", "text": prompt})
+
+                # Build conversation history for apiyi (no native chat session)
+                history_key = f"oai_{sid}"
+                if history_key not in sessions:
+                    sessions[history_key] = []  # list of messages
+                messages = list(sessions[history_key])  # copy
+                messages.append({"role": "user", "content": content_parts if img_bytes else prompt})
+
+                yield sse_event("text", "\u2728 \u751f\u6210\u4e2d\u2026\u8bf7\u7a0d\u5019\n\n")
+
+                r = oai.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    timeout=httpx.Timeout(300.0, connect=30.0),
+                )
+                content = r.choices[0].message.content or ""
+                # Parse images and text from response
+                parsed = parse_oai_image_response(content)
+                for ptype, pdata in parsed:
+                    if ptype == "image":
+                        url = save_image(pdata)
+                        yield sse_event("image", url)
+                    elif ptype == "text":
+                        yield sse_event("text", pdata)
+
+                # Save to conversation history
+                # For history, store text-only summary (don't store huge base64)
+                sessions[history_key] = messages  # includes user msg
+                sessions[history_key].append({"role": "assistant", "content": content})
+                # Keep last 10 turns to avoid memory bloat
+                if len(sessions[history_key]) > 20:
+                    sessions[history_key] = sessions[history_key][-20:]
+
+                # Usage / cost meta
+                usage = r.usage
+                if usage:
+                    inp_t = usage.prompt_tokens or 0
+                    out_t = usage.completion_tokens or 0
+                    total_t = usage.total_tokens or 0
+                    parts = [f'<span>\u8f93\u5165 {inp_t}</span>', f'<span>\u8f93\u51fa {out_t}</span>',
+                             f'<span>\u5408\u8ba1 {total_t} tokens</span>']
+                    yield sse_event("meta", ''.join(parts))
+
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                traceback.print_exc()
+                yield sse_event("error", f"\u9519\u8bef\uff1a{e}")
+
+        return StreamingResponse(stream_oai(), media_type="text/event-stream")
+
+    else:
+        # Google official path (streaming)
+        def stream_gen():
+            try:
+                chat = get_or_create_chat(sid, uid)
+                if not chat:
+                    yield sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")
+                    return
+                if img_bytes:
+                    contents = [types.Part.from_bytes(data=img_bytes, mime_type=img_ct), prompt]
+                else:
+                    contents = prompt
+                last_usage = None
+                for chunk in chat.send_message_stream(contents):
+                    if not chunk.candidates:
+                        continue
+                    cand = chunk.candidates[0]
+                    if cand.content and cand.content.parts:
+                        for part in cand.content.parts:
+                            if getattr(part, 'thought', False):
+                                continue
+                            if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                                url = save_image(part.inline_data.data)
+                                yield sse_event("image", url)
+                            elif hasattr(part, 'text') and part.text:
+                                yield sse_event("text", part.text)
+                    um = getattr(chunk, 'usage_metadata', None)
+                    if um and um.prompt_token_count:
+                        last_usage = um
+                if last_usage:
+                    um = last_usage
+                    inp_t = um.prompt_token_count or 0
+                    out_t = um.candidates_token_count or 0
+                    think_t = um.thoughts_token_count or 0
+                    img_t = 0
+                    for d in (um.candidates_tokens_details or []):
+                        if d.modality and d.modality.value == 'IMAGE':
+                            img_t = d.token_count or 0
+                    txt_out_t = out_t - img_t
+                    cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
+                    parts = [f'<span>\u8f93\u5165 {inp_t}</span>', f'<span>\u8f93\u51fa {out_t}</span>']
+                    if think_t:
+                        parts.append(f'<span>\u601d\u7ef4 {think_t}</span>')
+                    parts.append(f'<span>\u5408\u8ba1 {um.total_token_count or 0} tokens</span>')
+                    parts.append(f'<span>${cost:.4f}</span>')
+                    yield sse_event("meta", ''.join(parts))
+                ctx = build_context(sid)
+                yield sse_event("context", json.dumps(ctx, ensure_ascii=False))
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                traceback.print_exc()
+                yield sse_event("error", f"\u9519\u8bef\uff1a{e}")
+
+        return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
 
 @rt("/generated/{fname}")
@@ -588,8 +846,8 @@ def process_batch_item(batch_id: str, item_id: str):
     if not item:
         return
     uid = batch.get("uid", "")
-    client = get_client(uid)
-    if not client:
+    prov = get_provider(uid)
+    if not has_any_client(uid):
         item["status"] = "failed"
         item["error"] = "API Key \u672a\u8bbe\u7f6e"
         _maybe_finish_batch(batch_id)
@@ -602,37 +860,73 @@ def process_batch_item(batch_id: str, item_id: str):
     try:
         with open(item["src_path"], "rb") as f:
             img_bytes = f.read()
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=[types.Part.from_bytes(data=img_bytes, mime_type=item["src_mime"]),
-                      batch["prompt"]],
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
-                response_modalities=["TEXT", "IMAGE"],
-            ),
-        )
-        result_url = None
-        result_text = ""
-        if response.candidates and response.candidates[0].content:
-            for part in (response.candidates[0].content.parts or []):
-                if getattr(part, "thought", False):
-                    continue
-                if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
-                    result_url = save_image(part.inline_data.data)
-                elif hasattr(part, "text") and part.text:
-                    result_text += part.text
-        cost = 0.0
-        um = getattr(response, "usage_metadata", None)
-        if um:
-            inp_t = um.prompt_token_count or 0
-            out_t = um.candidates_token_count or 0
-            think_t = um.thoughts_token_count or 0
-            img_t = 0
-            for d in (um.candidates_tokens_details or []):
-                if d.modality and d.modality.value == "IMAGE":
-                    img_t = d.token_count or 0
-            txt_out_t = out_t - img_t
-            cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
+
+        if prov == "apiyi":
+            # OpenAI-compatible path
+            oai = get_oai_client(uid)
+            model = get_user_model(uid)
+            b64 = base64.b64encode(img_bytes).decode()
+            mime = item["src_mime"] or "image/png"
+            r = oai.chat.completions.create(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                        {"type": "text", "text": batch["prompt"]},
+                    ]
+                }],
+                timeout=httpx.Timeout(300.0, connect=30.0),
+            )
+            content = r.choices[0].message.content or ""
+            result_url = None
+            result_text = ""
+            parsed = parse_oai_image_response(content)
+            for ptype, pdata in parsed:
+                if ptype == "image" and not result_url:
+                    result_url = save_image(pdata)
+                elif ptype == "text":
+                    result_text += pdata
+            cost = 0.0
+            if r.usage:
+                # Rough cost estimate for proxy (no detailed breakdown)
+                cost = 0.0  # proxy cost is opaque
+        else:
+            # Google official path
+            client = get_client(uid)
+            model = get_user_model(uid)
+            response = client.models.generate_content(
+                model=model,
+                contents=[types.Part.from_bytes(data=img_bytes, mime_type=item["src_mime"]),
+                          batch["prompt"]],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
+                    response_modalities=["TEXT", "IMAGE"],
+                ),
+            )
+            result_url = None
+            result_text = ""
+            if response.candidates and response.candidates[0].content:
+                for part in (response.candidates[0].content.parts or []):
+                    if getattr(part, "thought", False):
+                        continue
+                    if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
+                        result_url = save_image(part.inline_data.data)
+                    elif hasattr(part, "text") and part.text:
+                        result_text += part.text
+            cost = 0.0
+            um = getattr(response, "usage_metadata", None)
+            if um:
+                inp_t = um.prompt_token_count or 0
+                out_t = um.candidates_token_count or 0
+                think_t = um.thoughts_token_count or 0
+                img_t = 0
+                for d in (um.candidates_tokens_details or []):
+                    if d.modality and d.modality.value == "IMAGE":
+                        img_t = d.token_count or 0
+                txt_out_t = out_t - img_t
+                cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
+
         item["result_url"] = result_url
         item["result_text"] = result_text
         item["cost"] = cost
@@ -912,7 +1206,7 @@ async def post_batch_start(request):
     form = await request.form()
     prompt = form.get("prompt", "").strip()
     uid = request.cookies.get("uid", "")
-    if not get_client(uid):
+    if not has_any_client(uid):
         return JSONResponse({"error": "\u8bf7\u5148\u8bbe\u7f6e API Key"}, status_code=400)
     if not prompt:
         return JSONResponse({"error": "\u8bf7\u8f93\u5165\u63d0\u793a\u8bcd"}, status_code=400)
