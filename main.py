@@ -198,12 +198,12 @@ function onProviderChange(sel){
   const p=sel.value;
   const mSel=document.getElementById('model-select');
   mSel.innerHTML='';
-  (providerModels[p]||[]).forEach(function(m){
+  (providerModels[p]||[]).forEach(function(m,i){
     const o=document.createElement('option');
     o.value=m[0]; o.textContent=m[1];
+    if(i===0) o.selected=true;
     mSel.appendChild(o);
   });
-  // Update placeholder hint
   const inp=document.getElementById('key-input');
   if(p==='google') inp.placeholder='AIzaSy...';
   else inp.placeholder='sk-...';
@@ -418,22 +418,20 @@ def key_modal():
     """Shared API Key settings modal with provider/model selection."""
     return Modal(
         Div(
-            Label("\u63d0\u4f9b\u5546", cls="text-sm font-medium"),
-            Select(
-                Option("Google \u5b98\u65b9", value="google", selected=True),
-                Option("Apiyi \u4ee3\u7406", value="apiyi"),
-                id="provider-select", cls="uk-select",
-                onchange="onProviderChange(this)",
-            ),
+            P("\u63d0\u4f9b\u5546", cls="text-sm font-medium mb-1"),
+            # Use raw <select> to avoid uk-select web component issues with JS
+            NotStr('<select id="provider-select" class="uk-select" onchange="onProviderChange(this)">'
+                   '<option value="google" selected>Google \u5b98\u65b9</option>'
+                   '<option value="apiyi">Apiyi \u4ee3\u7406</option>'
+                   '</select>'),
             cls="mb-3",
         ),
         Div(
-            Label("\u6a21\u578b", cls="text-sm font-medium"),
-            Select(
-                Option("Gemini 3.1 Flash Image", value="gemini-3.1-flash-image-preview", selected=True),
-                Option("Gemini 3 Pro Image", value="gemini-3-pro-image-preview"),
-                id="model-select", cls="uk-select",
-            ),
+            P("\u6a21\u578b", cls="text-sm font-medium mb-1"),
+            NotStr('<select id="model-select" class="uk-select">'
+                   '<option value="gemini-3.1-flash-image-preview" selected>Gemini 3.1 Flash Image</option>'
+                   '<option value="gemini-3-pro-image-preview">Gemini 3 Pro Image</option>'
+                   '</select>'),
             cls="mb-3",
         ),
         P("\u5728 ", A("Google AI Studio", href="https://aistudio.google.com/apikey",
