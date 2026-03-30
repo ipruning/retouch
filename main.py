@@ -1,7 +1,7 @@
 import uuid, os, traceback, json, hashlib, zipfile, io, threading, time, base64, re, logging
 from concurrent.futures import ThreadPoolExecutor
 
-log = logging.getLogger('imageapp')
+log = logging.getLogger('retouch')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 from fasthtml.common import *
 from monsterui.all import *
@@ -428,7 +428,7 @@ document.getElementById('prompt').addEventListener('keydown',function(e){
 # ── App setup ────────────────────────────────────────────────────────────
 app, rt = fast_app(
     hdrs=Theme.blue.headers(mode='light') + [Style(EXTRA_CSS)],
-    title='图片工作台',
+    title='Retouch',
     live=False,
 )
 
