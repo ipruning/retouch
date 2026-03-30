@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.sesskey
+*.jpg
+*.png
+test_outputs/
+generated/
+*.bak
+secret_audit_report.md
