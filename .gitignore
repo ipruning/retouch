@@ -1,11 +1,43 @@
+# ===== Python =====
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ===== Virtual Environments =====
 .venv/
+venv/
+env/
+
+# ===== Secrets & Credentials =====
 .env
+.env.*
 .sesskey
+*.pem
+*.key
+
+# ===== IDE & Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Media & Generated =====
 *.jpg
+*.jpeg
 *.png
-test_outputs/
+*.gif
+*.webp
 generated/
+test_outputs/
+
+# ===== Project-specific =====
 *.bak
+*.log
 secret_audit_report.md
