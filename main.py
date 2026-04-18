@@ -197,6 +197,21 @@ EXTRA_CSS = """\
 
 
 KEY_JS = """\
+function isDark(){ return document.documentElement.classList.contains('dark'); }
+function toggleDark(){
+  const html=document.documentElement;
+  const dark=!isDark();
+  html.classList.toggle('dark',dark);
+  const f=JSON.parse(localStorage.getItem('__FRANKEN__')||'{}');
+  f.mode=dark?'dark':'light';
+  localStorage.setItem('__FRANKEN__',JSON.stringify(f));
+  updateDarkBtn();
+}
+function updateDarkBtn(){
+  const btn=document.getElementById('dark-toggle');
+  if(btn) btn.innerHTML=isDark()?'☀️':'🌙';
+}
+document.addEventListener('DOMContentLoaded',updateDarkBtn);
 let hasKey=false, curProvider='google', curModel='';
 const providerModels={
   google:[
@@ -427,7 +442,7 @@ document.getElementById('prompt').addEventListener('keydown',function(e){
 
 # ── App setup ────────────────────────────────────────────────────────────
 app, rt = fast_app(
-    hdrs=Theme.blue.headers(mode='light') + [Style(EXTRA_CSS)],
+    hdrs=Theme.blue.headers(mode='auto') + [Style(EXTRA_CSS)],
     title='Retouch',
     live=False,
 )
@@ -480,6 +495,9 @@ def page_header(title, *extra_buttons):
             ),
             Div(
                 Span(id="key-status", cls="text-xs text-muted-foreground"),
+                Button(id="dark-toggle", cls=ButtonT.ghost,
+                       onclick="toggleDark()", title="切换深色模式",
+                       style="font-size:16px;min-width:32px;padding:4px;"),
                 Button(UkIcon('key', height=16), cls=ButtonT.ghost,
                        onclick="toggleKeyModal()", title="\u8bbe\u7f6e API Key"),
                 *extra_buttons,
@@ -494,7 +512,7 @@ def page_header(title, *extra_buttons):
 def get():
     return Container(
         page_header(
-            "\u56fe\u7247\u5de5\u4f5c\u53f0",
+            "Retouch",
             A("\u6279\u91cf", href="/batch", cls="uk-btn uk-btn-default uk-btn-sm whitespace-nowrap"),
             Button("\u65b0\u5bf9\u8bdd", cls=(ButtonT.default, ButtonT.sm, 'whitespace-nowrap'), onclick="newChat()"),
         ),
