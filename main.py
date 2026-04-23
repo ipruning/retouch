@@ -1,15 +1,30 @@
-import uuid, os, traceback, json, hashlib, zipfile, io, threading, time, base64, re, logging
+import base64
+import hashlib
+import io
+import json
+import logging
+import os
+import re
+import threading
+import time
+import traceback
+import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-log = logging.getLogger('retouch')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
-from fasthtml.common import *
-from monsterui.all import *
-from google import genai
-from google.genai import types
 import httpx
+from fasthtml.common import *
+from google import genai
+from google.genai import types as genai_types
+from monsterui.all import *
 from openai import OpenAI
 from starlette.responses import StreamingResponse
+
+log = logging.getLogger("retouch")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+)
+
 
 DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
 GEN_DIR = "generated"
@@ -34,26 +49,31 @@ PROVIDERS = {
     },
 }
 
-api_keys: dict = {}     # uid -> key
-clients: dict = {}      # uid -> google genai Client (google provider)
+api_keys: dict = {}  # uid -> key
+clients: dict = {}  # uid -> google genai Client (google provider)
 oai_clients: dict = {}  # uid -> OpenAI Client (apiyi provider)
-providers: dict = {}    # uid -> "google" | "apiyi"
+providers: dict = {}  # uid -> "google" | "apiyi"
 user_models: dict = {}  # uid -> selected model name
-sessions: dict = {}     # sid -> google chat session
+sessions: dict = {}  # sid -> google chat session
+
 
 def get_client(uid: str):
     """Return google genai client if google provider."""
     return clients.get(uid)
 
+
 def get_oai_client(uid: str):
     """Return OpenAI client if apiyi provider."""
     return oai_clients.get(uid)
 
+
 def get_provider(uid: str) -> str:
     return providers.get(uid, "google")
 
+
 def get_user_model(uid: str) -> str:
     return user_models.get(uid, DEFAULT_MODEL)
+
 
 def parse_oai_image_response(content: str):
     """Parse OpenAI-compatible response that contains markdown image(s).
@@ -64,47 +84,49 @@ def parse_oai_image_response(content: str):
     Supports both data:image base64 and https:// URL formats.
     """
     # Match both: ![image](data:image/...;base64,...) and ![image](https://...)
-    IMG_RE = re.compile(r'!\[(?:image)?\]\(([^)]+)\)')
+    IMG_RE = re.compile(r"!\[(?:image)?\]\(([^)]+)\)")
     parts = []
     last_end = 0
     for m in IMG_RE.finditer(content):
-        text_before = content[last_end:m.start()].strip()
+        text_before = content[last_end : m.start()].strip()
         if text_before:
-            parts.append(('text', text_before))
+            parts.append(("text", text_before))
         src = m.group(1)
-        if src.startswith('data:image/'):
+        if src.startswith("data:image/"):
             # Inline base64
             try:
-                b64 = src.split(',', 1)[1]
+                b64 = src.split(",", 1)[1]
                 img_data = base64.b64decode(b64)
-                parts.append(('image', img_data))
+                parts.append(("image", img_data))
             except Exception:
                 pass
-        elif src.startswith('http://') or src.startswith('https://'):
+        elif src.startswith("http://") or src.startswith("https://"):
             # External URL — download it
             try:
                 resp = httpx.get(src, timeout=30, follow_redirects=True)
                 if resp.status_code == 200 and len(resp.content) > 100:
-                    parts.append(('image', resp.content))
+                    parts.append(("image", resp.content))
                 else:
-                    parts.append(('image_url', src))
+                    parts.append(("image_url", src))
             except Exception:
-                parts.append(('image_url', src))
+                parts.append(("image_url", src))
         last_end = m.end()
     # Remaining text
     text_after = content[last_end:].strip()
     if text_after:
-        parts.append(('text', text_after))
+        parts.append(("text", text_after))
     return parts
+
 
 def save_image(data: bytes) -> str:
     h = hashlib.md5(data).hexdigest()
     fname = f"{h}.jpg"
     fpath = os.path.join(GEN_DIR, fname)
     if not os.path.exists(fpath):
-        with open(fpath, 'wb') as f:
+        with open(fpath, "wb") as f:
             f.write(data)
     return f"/generated/{fname}"
+
 
 def build_context(sid: str) -> dict:
     if sid not in sessions:
@@ -116,18 +138,23 @@ def build_context(sid: str) -> dict:
     for content in history:
         role = content.role or "?"
         parts_desc = []
-        for p in (content.parts or []):
-            if hasattr(p, 'inline_data') and p.inline_data and p.inline_data.data:
+        for p in content.parts or []:
+            if hasattr(p, "inline_data") and p.inline_data and p.inline_data.data:
                 size = len(p.inline_data.data)
                 total_bytes += size
                 url = save_image(p.inline_data.data)
                 parts_desc.append({"type": "image", "size": size, "url": url})
-            elif hasattr(p, 'text') and p.text and not getattr(p, 'thought', False):
+            elif hasattr(p, "text") and p.text and not getattr(p, "thought", False):
                 t = p.text
                 preview = (t[:40] + "\u2026") if len(t) > 40 else t
                 parts_desc.append({"type": "text", "value": preview})
         if parts_desc:
-            turns.append({"role": "\u4f60" if role == "user" else "\u6a21\u578b", "parts": parts_desc})
+            turns.append(
+                {
+                    "role": "\u4f60" if role == "user" else "\u6a21\u578b",
+                    "parts": parts_desc,
+                }
+            )
     return {"turns": turns, "total_bytes": total_bytes}
 
 
@@ -303,7 +330,9 @@ async function clearKey(){
 checkKey();
 """
 
-MAIN_JS = KEY_JS + """\
+MAIN_JS = (
+    KEY_JS
+    + """\
 let sid=localStorage.getItem('sid')||'',pastedFile=null;
 if(!sid){sid=crypto.randomUUID();localStorage.setItem('sid',sid);}
 
@@ -438,12 +467,13 @@ document.getElementById('prompt').addEventListener('keydown',function(e){
   if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();go();}
 });
 """
+)
 
 
 # ── App setup ────────────────────────────────────────────────────────────
 app, rt = fast_app(
-    hdrs=Theme.blue.headers(mode='auto') + [Style(EXTRA_CSS)],
-    title='Retouch',
+    hdrs=Theme.blue.headers(mode="auto") + [Style(EXTRA_CSS)],
+    title="Retouch",
     live=False,
 )
 
@@ -454,32 +484,58 @@ def key_modal():
         Div(
             P("\u63d0\u4f9b\u5546", cls="text-sm font-medium mb-1"),
             # Use raw <select> to avoid uk-select web component issues with JS
-            NotStr('<select id="provider-select" class="uk-select" onchange="onProviderChange(this)">'
-                   '<option value="google" selected>Google \u5b98\u65b9</option>'
-                   '<option value="apiyi">Apiyi \u4ee3\u7406</option>'
-                   '</select>'),
+            NotStr(
+                '<select id="provider-select" class="uk-select" onchange="onProviderChange(this)">'
+                '<option value="google" selected>Google \u5b98\u65b9</option>'
+                '<option value="apiyi">Apiyi \u4ee3\u7406</option>'
+                "</select>"
+            ),
             cls="mb-3",
         ),
         Div(
             P("\u6a21\u578b", cls="text-sm font-medium mb-1"),
-            NotStr('<select id="model-select" class="uk-select">'
-                   '<option value="gemini-3.1-flash-image-preview" selected>Gemini 3.1 Flash Image</option>'
-                   '<option value="gemini-3-pro-image-preview">Gemini 3 Pro Image</option>'
-                   '</select>'),
+            NotStr(
+                '<select id="model-select" class="uk-select">'
+                '<option value="gemini-3.1-flash-image-preview" selected>Gemini 3.1 Flash Image</option>'
+                '<option value="gemini-3-pro-image-preview">Gemini 3 Pro Image</option>'
+                "</select>"
+            ),
             cls="mb-3",
         ),
-        P("\u5728 ", A("Google AI Studio", href="https://aistudio.google.com/apikey",
-                    target="_blank", cls="text-primary underline"),
-          " \u6216 ", A("Apiyi", href="https://api.apiyi.com",
-                    target="_blank", cls="text-primary underline"),
-          " \u83b7\u53d6 Key", cls="text-sm text-muted-foreground"),
-        Input(type="password", id="key-input", placeholder="AIzaSy...",
-              cls="uk-input font-mono"),
+        P(
+            "\u5728 ",
+            A(
+                "Google AI Studio",
+                href="https://aistudio.google.com/apikey",
+                target="_blank",
+                cls="text-primary underline",
+            ),
+            " \u6216 ",
+            A(
+                "Apiyi",
+                href="https://api.apiyi.com",
+                target="_blank",
+                cls="text-primary underline",
+            ),
+            " \u83b7\u53d6 Key",
+            cls="text-sm text-muted-foreground",
+        ),
+        Input(
+            type="password",
+            id="key-input",
+            placeholder="AIzaSy...",
+            cls="uk-input font-mono",
+        ),
         Div(id="key-msg"),
         header=H3("\u8bbe\u7f6e API Key", cls="text-lg font-semibold"),
         footer=DivFullySpaced(
             Button("\u6e05\u9664", cls=ButtonT.ghost, onclick="clearKey()"),
-            Button("\u4fdd\u5b58", cls=ButtonT.primary, onclick="saveKey()", id="key-save-btn"),
+            Button(
+                "\u4fdd\u5b58",
+                cls=ButtonT.primary,
+                onclick="saveKey()",
+                id="key-save-btn",
+            ),
         ),
         id="key-modal",
     )
@@ -495,11 +551,19 @@ def page_header(title, *extra_buttons):
             ),
             Div(
                 Span(id="key-status", cls="text-xs text-muted-foreground"),
-                Button(id="dark-toggle", cls=ButtonT.ghost,
-                       onclick="toggleDark()", title="切换深色模式",
-                       style="font-size:16px;min-width:32px;padding:4px;"),
-                Button(UkIcon('key', height=16), cls=ButtonT.ghost,
-                       onclick="toggleKeyModal()", title="\u8bbe\u7f6e API Key"),
+                Button(
+                    id="dark-toggle",
+                    cls=ButtonT.ghost,
+                    onclick="toggleDark()",
+                    title="切换深色模式",
+                    style="font-size:16px;min-width:32px;padding:4px;",
+                ),
+                Button(
+                    UkIcon("key", height=16),
+                    cls=ButtonT.ghost,
+                    onclick="toggleKeyModal()",
+                    title="\u8bbe\u7f6e API Key",
+                ),
                 *extra_buttons,
                 cls="flex items-center gap-1 flex-shrink-0",
             ),
@@ -513,8 +577,16 @@ def get():
     return Container(
         page_header(
             "Retouch",
-            A("\u6279\u91cf", href="/batch", cls="uk-btn uk-btn-default uk-btn-sm whitespace-nowrap"),
-            Button("\u65b0\u5bf9\u8bdd", cls=(ButtonT.default, ButtonT.sm, 'whitespace-nowrap'), onclick="newChat()"),
+            A(
+                "\u6279\u91cf",
+                href="/batch",
+                cls="uk-btn uk-btn-default uk-btn-sm whitespace-nowrap",
+            ),
+            Button(
+                "\u65b0\u5bf9\u8bdd",
+                cls=(ButtonT.default, ButtonT.sm, "whitespace-nowrap"),
+                onclick="newChat()",
+            ),
         ),
         Card(
             Div(Div("\u65b0\u5bf9\u8bdd", cls="ctx-empty"), id="ctx-list"),
@@ -523,22 +595,36 @@ def get():
                 Img(src="", alt=""),
                 Span(cls="upload-name"),
                 Button("\u00d7", cls="upload-x", onclick="clearImage()"),
-                id="upload-preview", cls="upload-preview hide",
+                id="upload-preview",
+                cls="upload-preview hide",
             ),
-            Textarea(id="prompt", placeholder="\u63cf\u8ff0\u4f60\u60f3\u8981\u7684\u56fe\u7247\u2026",
-                     cls="uk-textarea", rows=3),
+            Textarea(
+                id="prompt",
+                placeholder="\u63cf\u8ff0\u4f60\u60f3\u8981\u7684\u56fe\u7247\u2026",
+                cls="uk-textarea",
+                rows=3,
+            ),
             header=P("\u4e0a\u4e0b\u6587", cls=TextPresets.muted_sm),
             footer=Div(
                 DivFullySpaced(
                     Label(
-                        UkIcon('paperclip', height=16),
+                        UkIcon("paperclip", height=16),
                         " \u4e0a\u4f20\u56fe\u7247",
-                        Input(type="file", id="file", accept="image/*",
-                              onchange="onFile(this)", cls="hidden"),
+                        Input(
+                            type="file",
+                            id="file",
+                            accept="image/*",
+                            onchange="onFile(this)",
+                            cls="hidden",
+                        ),
                         cls="cursor-pointer text-sm text-muted-foreground flex items-center gap-1",
                     ),
-                    Button("\u751f\u6210", id="btn", cls=(ButtonT.primary, 'min-w-[120px] justify-center'),
-                           onclick="go()"),
+                    Button(
+                        "\u751f\u6210",
+                        id="btn",
+                        cls=(ButtonT.primary, "min-w-[120px] justify-center"),
+                        onclick="go()",
+                    ),
                 ),
                 Div(id="env-footer", cls="text-xs text-muted-foreground mt-2"),
             ),
@@ -561,12 +647,15 @@ def get_or_create_chat(sid: str, uid: str):
     if sid not in sessions:
         sessions[sid] = client.chats.create(
             model=model,
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
-                response_modalities=["TEXT", "IMAGE"]
-            )
+            config=genai_types.GenerateContentConfig(
+                thinking_config=genai_types.ThinkingConfig(
+                    thinking_level=genai_types.ThinkingLevel.HIGH
+                ),
+                response_modalities=["TEXT", "IMAGE"],
+            ),
         )
     return sessions[sid]
+
 
 def has_any_client(uid: str) -> bool:
     """Check if user has any configured client."""
@@ -629,9 +718,12 @@ async def post_api_key(request):
     to_del = [k for k in sessions if k.startswith(uid + "_")]
     for k in to_del:
         del sessions[k]
-    resp = JSONResponse({"ok": True, "masked": key[:6] + "..." + key[-4:], "model_label": model_label})
-    resp.set_cookie("uid", uid, max_age=86400*365, httponly=True, samesite="lax")
+    resp = JSONResponse(
+        {"ok": True, "masked": key[:6] + "..." + key[-4:], "model_label": model_label}
+    )
+    resp.set_cookie("uid", uid, max_age=86400 * 365, httponly=True, samesite="lax")
     return resp
+
 
 @rt("/api/key", methods=["GET"])
 def get_api_key(request):
@@ -645,9 +737,17 @@ def get_api_key(request):
             if mid == model:
                 model_label = mlbl
                 break
-        return JSONResponse({"has_key": True, "masked": k[:6] + "..." + k[-4:],
-                             "provider": prov, "model": model, "model_label": model_label})
+        return JSONResponse(
+            {
+                "has_key": True,
+                "masked": k[:6] + "..." + k[-4:],
+                "provider": prov,
+                "model": model,
+                "model_label": model_label,
+            }
+        )
     return JSONResponse({"has_key": False})
+
 
 @rt("/api/key", methods=["DELETE"])
 def delete_api_key(request):
@@ -675,16 +775,25 @@ async def post_generate(request):
     sid = form.get("sid", "")
     uid = request.cookies.get("uid", "")
     if not prompt:
-        return StreamingResponse(iter([sse_event("error", "\u8bf7\u8f93\u5165\u63cf\u8ff0")]), media_type="text/event-stream")
+        return StreamingResponse(
+            iter([sse_event("error", "\u8bf7\u8f93\u5165\u63cf\u8ff0")]),
+            media_type="text/event-stream",
+        )
     if not sid:
-        return StreamingResponse(iter([sse_event("error", "\u7f3a\u5c11\u4f1a\u8bdd")]), media_type="text/event-stream")
+        return StreamingResponse(
+            iter([sse_event("error", "\u7f3a\u5c11\u4f1a\u8bdd")]),
+            media_type="text/event-stream",
+        )
     if not has_any_client(uid):
-        return StreamingResponse(iter([sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")]), media_type="text/event-stream")
+        return StreamingResponse(
+            iter([sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")]),
+            media_type="text/event-stream",
+        )
 
     img_bytes = None
     img_ct = None
     upload = form.get("image")
-    if upload and hasattr(upload, 'read'):
+    if upload and hasattr(upload, "read"):
         img_bytes = await upload.read()
         img_ct = upload.content_type or "image/png"
 
@@ -704,7 +813,12 @@ async def post_generate(request):
                 if img_bytes:
                     b64 = base64.b64encode(img_bytes).decode()
                     mime = img_ct or "image/png"
-                    content_parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                    content_parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                        }
+                    )
                 content_parts.append({"type": "text", "text": prompt})
 
                 # Build conversation history for apiyi (no native chat session)
@@ -712,9 +826,13 @@ async def post_generate(request):
                 if history_key not in sessions:
                     sessions[history_key] = []  # list of messages
                 messages = list(sessions[history_key])  # copy
-                messages.append({"role": "user", "content": content_parts if img_bytes else prompt})
+                messages.append(
+                    {"role": "user", "content": content_parts if img_bytes else prompt}
+                )
 
-                yield sse_event("text", "\u2728 \u751f\u6210\u4e2d\u2026\u8bf7\u7a0d\u5019\n\n")
+                yield sse_event(
+                    "text", "\u2728 \u751f\u6210\u4e2d\u2026\u8bf7\u7a0d\u5019\n\n"
+                )
 
                 r = oai.chat.completions.create(
                     model=model,
@@ -747,9 +865,12 @@ async def post_generate(request):
                     inp_t = usage.prompt_tokens or 0
                     out_t = usage.completion_tokens or 0
                     total_t = usage.total_tokens or 0
-                    parts = [f'<span>\u8f93\u5165 {inp_t}</span>', f'<span>\u8f93\u51fa {out_t}</span>',
-                             f'<span>\u5408\u8ba1 {total_t} tokens</span>']
-                    yield sse_event("meta", ''.join(parts))
+                    parts = [
+                        f"<span>\u8f93\u5165 {inp_t}</span>",
+                        f"<span>\u8f93\u51fa {out_t}</span>",
+                        f"<span>\u5408\u8ba1 {total_t} tokens</span>",
+                    ]
+                    yield sse_event("meta", "".join(parts))
 
                 yield "data: [DONE]\n\n"
             except Exception as e:
@@ -767,7 +888,12 @@ async def post_generate(request):
                     yield sse_event("error", "\u8bf7\u5148\u8bbe\u7f6e API Key")
                     return
                 if img_bytes:
-                    contents = [types.Part.from_bytes(data=img_bytes, mime_type=img_ct), prompt]
+                    contents = [
+                        genai_types.Part.from_bytes(
+                            data=img_bytes, mime_type=img_ct or "image/png"
+                        ),
+                        prompt,
+                    ]
                 else:
                     contents = prompt
                 last_usage = None
@@ -777,14 +903,18 @@ async def post_generate(request):
                     cand = chunk.candidates[0]
                     if cand.content and cand.content.parts:
                         for part in cand.content.parts:
-                            if getattr(part, 'thought', False):
+                            if getattr(part, "thought", False):
                                 continue
-                            if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                            if (
+                                hasattr(part, "inline_data")
+                                and part.inline_data
+                                and part.inline_data.data
+                            ):
                                 url = save_image(part.inline_data.data)
                                 yield sse_event("image", url)
-                            elif hasattr(part, 'text') and part.text:
+                            elif hasattr(part, "text") and part.text:
                                 yield sse_event("text", part.text)
-                    um = getattr(chunk, 'usage_metadata', None)
+                    um = getattr(chunk, "usage_metadata", None)
                     if um and um.prompt_token_count:
                         last_usage = um
                 if last_usage:
@@ -793,17 +923,24 @@ async def post_generate(request):
                     out_t = um.candidates_token_count or 0
                     think_t = um.thoughts_token_count or 0
                     img_t = 0
-                    for d in (um.candidates_tokens_details or []):
-                        if d.modality and d.modality.value == 'IMAGE':
+                    for d in um.candidates_tokens_details or []:
+                        if d.modality and d.modality.value == "IMAGE":
                             img_t = d.token_count or 0
                     txt_out_t = out_t - img_t
-                    cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
-                    parts = [f'<span>\u8f93\u5165 {inp_t}</span>', f'<span>\u8f93\u51fa {out_t}</span>']
+                    cost = (
+                        inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0
+                    ) / 1_000_000
+                    parts = [
+                        f"<span>\u8f93\u5165 {inp_t}</span>",
+                        f"<span>\u8f93\u51fa {out_t}</span>",
+                    ]
                     if think_t:
-                        parts.append(f'<span>\u601d\u7ef4 {think_t}</span>')
-                    parts.append(f'<span>\u5408\u8ba1 {um.total_token_count or 0} tokens</span>')
-                    parts.append(f'<span>${cost:.4f}</span>')
-                    yield sse_event("meta", ''.join(parts))
+                        parts.append(f"<span>\u601d\u7ef4 {think_t}</span>")
+                    parts.append(
+                        f"<span>\u5408\u8ba1 {um.total_token_count or 0} tokens</span>"
+                    )
+                    parts.append(f"<span>${cost:.4f}</span>")
+                    yield sse_event("meta", "".join(parts))
                 ctx = build_context(sid)
                 yield sse_event("context", json.dumps(ctx, ensure_ascii=False))
                 yield "data: [DONE]\n\n"
@@ -845,25 +982,33 @@ _user_sems_lock = threading.Lock()
 batches: dict = {}
 _batches_lock = threading.Lock()
 
+
 def _get_user_sem(uid: str) -> threading.Semaphore:
     with _user_sems_lock:
         if uid not in _user_sems:
             _user_sems[uid] = threading.Semaphore(_USER_SEM_LIMIT)
         return _user_sems[uid]
 
+
 def _user_active_batches(uid: str) -> int:
     with _batches_lock:
-        return sum(1 for b in batches.values()
-                   if b.get("uid") == uid and not b.get("finished"))
+        return sum(
+            1 for b in batches.values() if b.get("uid") == uid and not b.get("finished")
+        )
+
 
 def _cleanup_old_batches():
     """Remove batches older than _BATCH_TTL."""
     now = time.time()
     with _batches_lock:
-        to_del = [bid for bid, b in batches.items()
-                  if b.get("finished") and now - b["finished"] > _BATCH_TTL]
+        to_del = [
+            bid
+            for bid, b in batches.items()
+            if b.get("finished") and now - b["finished"] > _BATCH_TTL
+        ]
         for bid in to_del:
             del batches[bid]
+
 
 def _find_item(batch_id: str, item_id: str):
     batch = batches.get(batch_id)
@@ -873,6 +1018,7 @@ def _find_item(batch_id: str, item_id: str):
         if it["id"] == item_id:
             return batch, it
     return batch, None
+
 
 def process_batch_item(batch_id: str, item_id: str):
     batch, item = _find_item(batch_id, item_id)
@@ -906,21 +1052,30 @@ def process_batch_item(batch_id: str, item_id: str):
             )
             b64 = base64.b64encode(img_bytes).decode()
             mime = item["src_mime"] or "image/png"
-            log.info(f"Batch {batch_id}/{item_id}: calling Apiyi model={model} img_size={len(img_bytes)/1024:.0f}KB b64_size={len(b64)/1024:.0f}KB")
+            log.info(
+                f"Batch {batch_id}/{item_id}: calling Apiyi model={model} img_size={len(img_bytes) / 1024:.0f}KB b64_size={len(b64) / 1024:.0f}KB"
+            )
             t0 = time.time()
             r = oai.chat.completions.create(
                 model=model,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                        {"type": "text", "text": batch["prompt"]},
-                    ]
-                }],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{b64}"},
+                            },
+                            {"type": "text", "text": batch["prompt"]},
+                        ],
+                    }
+                ],
             )
             elapsed = time.time() - t0
             content = r.choices[0].message.content or ""
-            log.info(f"Batch {batch_id}/{item_id}: got response in {elapsed:.1f}s, content_len={len(content)}")
+            log.info(
+                f"Batch {batch_id}/{item_id}: got response in {elapsed:.1f}s, content_len={len(content)}"
+            )
             result_url = None
             result_text = ""
             parsed = parse_oai_image_response(content)
@@ -949,20 +1104,30 @@ def process_batch_item(batch_id: str, item_id: str):
             model = get_user_model(uid)
             response = client.models.generate_content(
                 model=model,
-                contents=[types.Part.from_bytes(data=img_bytes, mime_type=item["src_mime"]),
-                          batch["prompt"]],
-                config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
+                contents=[
+                    genai_types.Part.from_bytes(
+                        data=img_bytes, mime_type=item["src_mime"]
+                    ),
+                    batch["prompt"],
+                ],
+                config=genai_types.GenerateContentConfig(
+                    thinking_config=genai_types.ThinkingConfig(
+                        thinking_level=genai_types.ThinkingLevel.HIGH
+                    ),
                     response_modalities=["TEXT", "IMAGE"],
                 ),
             )
             result_url = None
             result_text = ""
             if response.candidates and response.candidates[0].content:
-                for part in (response.candidates[0].content.parts or []):
+                for part in response.candidates[0].content.parts or []:
                     if getattr(part, "thought", False):
                         continue
-                    if hasattr(part, "inline_data") and part.inline_data and part.inline_data.data:
+                    if (
+                        hasattr(part, "inline_data")
+                        and part.inline_data
+                        and part.inline_data.data
+                    ):
                         result_url = save_image(part.inline_data.data)
                     elif hasattr(part, "text") and part.text:
                         result_text += part.text
@@ -973,11 +1138,13 @@ def process_batch_item(batch_id: str, item_id: str):
                 out_t = um.candidates_token_count or 0
                 think_t = um.thoughts_token_count or 0
                 img_t = 0
-                for d in (um.candidates_tokens_details or []):
+                for d in um.candidates_tokens_details or []:
                     if d.modality and d.modality.value == "IMAGE":
                         img_t = d.token_count or 0
                 txt_out_t = out_t - img_t
-                cost = (inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0) / 1_000_000
+                cost = (
+                    inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0
+                ) / 1_000_000
 
         item["result_url"] = result_url
         item["result_text"] = result_text
@@ -986,7 +1153,9 @@ def process_batch_item(batch_id: str, item_id: str):
             item["status"] = "done"
         else:
             item["status"] = "failed"
-            item["error"] = item.get("error") or "\u6a21\u578b\u672a\u8fd4\u56de\u56fe\u7247"
+            item["error"] = (
+                item.get("error") or "\u6a21\u578b\u672a\u8fd4\u56de\u56fe\u7247"
+            )
     except Exception as e:
         log.error(f"Batch {batch_id}/{item_id}: error: {e}")
         traceback.print_exc()
@@ -996,6 +1165,7 @@ def process_batch_item(batch_id: str, item_id: str):
         _global_sem.release()
         user_sem.release()
         _maybe_finish_batch(batch_id)
+
 
 def _maybe_finish_batch(batch_id: str):
     """Mark batch as finished when all items are terminal, trigger cleanup."""
@@ -1087,7 +1257,7 @@ async function startBatch(){
     renderGrid();
     startPoll();
   }catch(e){
-    alert('上传失败: '+e.message);
+    alert('上传失败：'+e.message);
     btn.disabled=false; btn.classList.remove('btn-loading'); btn.textContent='开始处理';
   }
 }
@@ -1181,7 +1351,7 @@ async function retrySelected(){
   try{
     await fetch('/batch/retry/'+batchId+'/'+it.id,{method:'POST'});
     if(!pollTimer) startPoll();
-  }catch(e){alert('重试失败: '+e.message);}
+  }catch(e){alert('重试失败：'+e.message);}
   finally{ btn.disabled=false; btn.textContent='重试'; }
 }
 
@@ -1200,57 +1370,91 @@ def get_batch():
     return Container(
         page_header(
             "\u6279\u91cf\u5904\u7406",
-            A("\u2190 \u5355\u5f20", href="/", cls="uk-btn uk-btn-default uk-btn-sm whitespace-nowrap"),
+            A(
+                "\u2190 \u5355\u5f20",
+                href="/",
+                cls="uk-btn uk-btn-default uk-btn-sm whitespace-nowrap",
+            ),
         ),
         Card(
-            Textarea(id="b-prompt",
-                     placeholder="\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u5c06\u5e94\u7528\u5230\u6240\u6709\u56fe\u7247\u2026",
-                     cls="uk-textarea", rows=3),
+            Textarea(
+                id="b-prompt",
+                placeholder="\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u5c06\u5e94\u7528\u5230\u6240\u6709\u56fe\u7247\u2026",
+                cls="uk-textarea",
+                rows=3,
+            ),
         ),
         Div(
             Input(type="file", id="b-files", multiple=True, accept="image/*"),
             DivCentered(
-                UkIcon('upload', height=32, cls="text-muted-foreground"),
-                P("\u62d6\u62fd\u6216\u70b9\u51fb\u4e0a\u4f20\u56fe\u7247\uff08\u652f\u6301\u591a\u9009\uff09",
-                  cls="text-sm text-muted-foreground"),
+                UkIcon("upload", height=32, cls="text-muted-foreground"),
+                P(
+                    "\u62d6\u62fd\u6216\u70b9\u51fb\u4e0a\u4f20\u56fe\u7247\uff08\u652f\u6301\u591a\u9009\uff09",
+                    cls="text-sm text-muted-foreground",
+                ),
             ),
-            id="b-drop", cls="b-drop",
+            id="b-drop",
+            cls="b-drop",
         ),
         Div(id="b-grid", cls="b-grid"),
         Div(
             DivFullySpaced(
                 Span(id="b-estimate", cls="text-sm text-muted-foreground"),
-                Button("\u5f00\u59cb\u5904\u7406", id="b-start", cls=(ButtonT.primary, 'min-w-[120px] justify-center'),
-                       onclick="startBatch()"),
+                Button(
+                    "\u5f00\u59cb\u5904\u7406",
+                    id="b-start",
+                    cls=(ButtonT.primary, "min-w-[120px] justify-center"),
+                    onclick="startBatch()",
+                ),
             ),
-            id="b-controls", style="display:none",
+            id="b-controls",
+            style="display:none",
         ),
         Div(
             Div(id="b-progress-text", cls="b-progress-text"),
             Div(Div(id="b-bar-fill", cls="b-bar-fill"), cls="b-bar"),
-            id="b-progress", style="display:none",
+            id="b-progress",
+            style="display:none",
         ),
         Card(
             Div(id="b-compare-title", cls="b-compare-title"),
             Div(
-                Div(Div("\u539f\u56fe", cls="b-compare-label"), Img(id="b-cmp-src", src="")),
-                Div(Div("\u7ed3\u679c", cls="b-compare-label"), Img(id="b-cmp-res", src="")),
+                Div(
+                    Div("\u539f\u56fe", cls="b-compare-label"),
+                    Img(id="b-cmp-src", src=""),
+                ),
+                Div(
+                    Div("\u7ed3\u679c", cls="b-compare-label"),
+                    Img(id="b-cmp-res", src=""),
+                ),
                 cls="b-compare-imgs",
             ),
             Div(id="b-compare-error", cls="b-compare-error", style="display:none"),
             Div(id="b-compare-meta", cls="b-compare-meta"),
-            Button("\u91cd\u8bd5", id="b-retry-btn", cls=ButtonT.destructive,
-                   style="display:none", onclick="retrySelected()"),
-            id="b-compare", style="display:none",
+            Button(
+                "\u91cd\u8bd5",
+                id="b-retry-btn",
+                cls=ButtonT.destructive,
+                style="display:none",
+                onclick="retrySelected()",
+            ),
+            id="b-compare",
+            style="display:none",
         ),
         Div(
-            Button(UkIcon('download', height=16), " \u6253\u5305\u4e0b\u8f7d",
-                   cls=ButtonT.primary, onclick="downloadZip()"),
-            id="b-done", cls="mt-4", style="display:none",
+            Button(
+                UkIcon("download", height=16),
+                " \u6253\u5305\u4e0b\u8f7d",
+                cls=ButtonT.primary,
+                onclick="downloadZip()",
+            ),
+            id="b-done",
+            cls="mt-4",
+            style="display:none",
         ),
         key_modal(),
         Script(BATCH_JS),
-        cls=(ContainerT.sm, 'space-y-4'),
+        cls=(ContainerT.sm, "space-y-4"),
     )
 
 
@@ -1260,17 +1464,33 @@ async def post_batch_start(request):
     prompt = form.get("prompt", "").strip()
     uid = request.cookies.get("uid", "")
     if not has_any_client(uid):
-        return JSONResponse({"error": "\u8bf7\u5148\u8bbe\u7f6e API Key"}, status_code=400)
+        return JSONResponse(
+            {"error": "\u8bf7\u5148\u8bbe\u7f6e API Key"}, status_code=400
+        )
     if not prompt:
-        return JSONResponse({"error": "\u8bf7\u8f93\u5165\u63d0\u793a\u8bcd"}, status_code=400)
+        return JSONResponse(
+            {"error": "\u8bf7\u8f93\u5165\u63d0\u793a\u8bcd"}, status_code=400
+        )
     # Rate-limit: max concurrent batches per user
     if _user_active_batches(uid) >= _USER_MAX_BATCHES:
-        return JSONResponse({"error": f"\u6bcf\u4f4d\u7528\u6237\u6700\u591a\u540c\u65f6\u8fd0\u884c {_USER_MAX_BATCHES} \u4e2a\u6279\u6b21"}, status_code=429)
+        return JSONResponse(
+            {
+                "error": f"\u6bcf\u4f4d\u7528\u6237\u6700\u591a\u540c\u65f6\u8fd0\u884c {_USER_MAX_BATCHES} \u4e2a\u6279\u6b21"
+            },
+            status_code=429,
+        )
     raw_images = form.getlist("images")
     if not raw_images:
-        return JSONResponse({"error": "\u8bf7\u4e0a\u4f20\u56fe\u7247"}, status_code=400)
+        return JSONResponse(
+            {"error": "\u8bf7\u4e0a\u4f20\u56fe\u7247"}, status_code=400
+        )
     if len(raw_images) > _BATCH_MAX_IMAGES:
-        return JSONResponse({"error": f"\u5355\u6b21\u6700\u591a {_BATCH_MAX_IMAGES} \u5f20\u56fe\u7247"}, status_code=400)
+        return JSONResponse(
+            {
+                "error": f"\u5355\u6b21\u6700\u591a {_BATCH_MAX_IMAGES} \u5f20\u56fe\u7247"
+            },
+            status_code=400,
+        )
     batch_id = uuid.uuid4().hex[:12]
     items = []
     for upload in raw_images:
@@ -1283,15 +1503,31 @@ async def post_batch_start(request):
         src_url = save_image(data)
         src_path = os.path.join(GEN_DIR, os.path.basename(src_url))
         mime = getattr(upload, "content_type", None) or "image/png"
-        items.append({
-            "id": item_id, "status": "pending",
-            "src_url": src_url, "src_path": src_path, "src_mime": mime,
-            "result_url": None, "result_text": None, "error": None, "cost": 0.0,
-        })
+        items.append(
+            {
+                "id": item_id,
+                "status": "pending",
+                "src_url": src_url,
+                "src_path": src_path,
+                "src_mime": mime,
+                "result_url": None,
+                "result_text": None,
+                "error": None,
+                "cost": 0.0,
+            }
+        )
     if not items:
-        return JSONResponse({"error": "\u672a\u68c0\u6d4b\u5230\u6709\u6548\u56fe\u7247"}, status_code=400)
+        return JSONResponse(
+            {"error": "\u672a\u68c0\u6d4b\u5230\u6709\u6548\u56fe\u7247"},
+            status_code=400,
+        )
     with _batches_lock:
-        batches[batch_id] = {"prompt": prompt, "items": items, "uid": uid, "finished": None}
+        batches[batch_id] = {
+            "prompt": prompt,
+            "items": items,
+            "uid": uid,
+            "finished": None,
+        }
     for item in items:
         batch_pool.submit(process_batch_item, batch_id, item["id"])
     return JSONResponse({"batch_id": batch_id})
@@ -1301,27 +1537,45 @@ async def post_batch_start(request):
 def get_batch_status(batch_id: str):
     batch = batches.get(batch_id)
     if not batch:
-        return JSONResponse({"error": "\u6279\u6b21\u4e0d\u5b58\u5728"}, status_code=404)
+        return JSONResponse(
+            {"error": "\u6279\u6b21\u4e0d\u5b58\u5728"}, status_code=404
+        )
     items_out = []
     total = len(batch["items"])
     done = failed = running = 0
     cost = 0.0
     for it in batch["items"]:
         s = it["status"]
-        if s == "done": done += 1
-        elif s == "failed": failed += 1
-        elif s == "running": running += 1
+        if s == "done":
+            done += 1
+        elif s == "failed":
+            failed += 1
+        elif s == "running":
+            running += 1
         cost += it.get("cost", 0.0)
-        items_out.append({
-            "id": it["id"], "status": s, "src_url": it["src_url"],
-            "result_url": it.get("result_url"), "result_text": it.get("result_text"),
-            "error": it.get("error"), "cost": it.get("cost", 0.0),
-        })
+        items_out.append(
+            {
+                "id": it["id"],
+                "status": s,
+                "src_url": it["src_url"],
+                "result_url": it.get("result_url"),
+                "result_text": it.get("result_text"),
+                "error": it.get("error"),
+                "cost": it.get("cost", 0.0),
+            }
+        )
     finished = batch.get("finished") is not None
-    return JSONResponse({
-        "total": total, "done": done, "failed": failed, "running": running,
-        "cost": cost, "finished": finished, "items": items_out,
-    })
+    return JSONResponse(
+        {
+            "total": total,
+            "done": done,
+            "failed": failed,
+            "running": running,
+            "cost": cost,
+            "finished": finished,
+            "items": items_out,
+        }
+    )
 
 
 @rt("/batch/retry/{batch_id}/{item_id}", methods=["POST"])
@@ -1346,15 +1600,16 @@ def get_batch_download(batch_id: str):
     if not batch:
         return Response("Not found", status_code=404)
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, it in enumerate(batch["items"]):
             if it["status"] == "done" and it.get("result_url"):
                 fpath = os.path.join(GEN_DIR, os.path.basename(it["result_url"]))
                 if os.path.exists(fpath):
-                    zf.write(fpath, f"result_{i+1}.jpg")
+                    zf.write(fpath, f"result_{i + 1}.jpg")
     buf.seek(0)
     return StreamingResponse(
-        buf, media_type="application/zip",
+        buf,
+        media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename=batch_{batch_id}.zip"},
     )
 
