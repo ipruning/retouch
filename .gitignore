@@ -7,6 +7,9 @@ dist/
 build/
 *.egg
 
+# ===== Python Ruff =====
+.ruff_cache
+
 # ===== Virtual Environments =====
 .venv/
 venv/
