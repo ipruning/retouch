@@ -12,6 +12,10 @@ def detect_image_ext(data: bytes) -> str:
     return "jpg"
 
 
+def file_url(fname: str) -> str:
+    return f"/files/{fname}"
+
+
 def save_image(data: bytes) -> str:
     h = hashlib.md5(data).hexdigest()
     ext = detect_image_ext(data)
@@ -20,7 +24,7 @@ def save_image(data: bytes) -> str:
     if not os.path.exists(fpath):
         with open(fpath, "wb") as f:
             f.write(data)
-    return f"/generated/{fname}"
+    return file_url(fname)
 
 
 def detect_mime(fpath: str) -> str:
@@ -36,7 +40,7 @@ def detect_mime(fpath: str) -> str:
     return "image/jpeg"
 
 
-def generated_response(fname: str):
+def file_response(fname: str):
     fpath = os.path.join(GEN_DIR, fname)
     if os.path.exists(fpath):
         return FileResponse(fpath, media_type=detect_mime(fpath))

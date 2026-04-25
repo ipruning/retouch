@@ -365,18 +365,18 @@ def register_routes(rt):
     def batch_index():
         return batch_page()
 
-    @rt("/batch/start", methods=["POST"])
+    @rt("/api/batches", methods=["POST"])
     async def batch_start(request):
         return await post_batch_start(request)
 
-    @rt("/batch/status/{batch_id}")
+    @rt("/api/batches/{batch_id}")
     def batch_status(batch_id: str):
         return get_batch_status(batch_id)
 
-    @rt("/batch/retry/{batch_id}/{item_id}", methods=["POST"])
+    @rt("/api/batches/{batch_id}/items/{item_id}/retry", methods=["POST"])
     def batch_retry(batch_id: str, item_id: str):
         return post_batch_retry(batch_id, item_id)
 
-    @rt("/batch/download/{batch_id}")
+    @rt("/api/batches/{batch_id}/archive")
     def batch_download(batch_id: str):
         return get_batch_download(batch_id)

@@ -4,7 +4,7 @@ from fasthtml.common import *
 from monsterui.all import *
 
 from config import EXTRA_CSS
-from routes import batch, key, single
+from routes import batch, single, user
 
 log = logging.getLogger("retouch")
 logging.basicConfig(
@@ -17,7 +17,7 @@ app, rt = fast_app(
     live=False,
 )
 
-key.register_routes(rt)
+user.register_routes(rt)
 single.register_routes(rt)
 batch.register_routes(rt)
 

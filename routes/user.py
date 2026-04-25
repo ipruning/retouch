@@ -23,11 +23,37 @@ def model_label_for(provider: str, model: str) -> str:
     return model
 
 
+def providers_payload() -> dict:
+    return {
+        "providers": [
+            {
+                "id": pid,
+                "name": cfg["name"],
+                "models": [
+                    {
+                        "id": mid,
+                        "name": label,
+                        "supports_stream": pid == "google",
+                        "supports_image_input": True,
+                        "supports_image_output": True,
+                    }
+                    for mid, label in cfg.get("models", [])
+                ],
+            }
+            for pid, cfg in PROVIDERS.items()
+        ]
+    }
+
+
 def register_routes(rt):
-    @rt("/api/key", methods=["POST"])
-    async def post_api_key(request):
+    @rt("/api/providers", methods=["GET"])
+    def get_providers():
+        return JSONResponse(providers_payload())
+
+    @rt("/api/user/config", methods=["PUT"])
+    async def put_user_config(request):
         body = await request.json()
-        key = (body.get("key") or "").strip()
+        key = (body.get("api_key") or body.get("key") or "").strip()
         provider = (body.get("provider") or "google").strip()
         model = (body.get("model") or DEFAULT_MODEL).strip()
         if not key:
@@ -56,14 +82,15 @@ def register_routes(rt):
         user_providers[uid] = provider
         user_models[uid] = model
         clear_sessions_for_user(uid)
+        masked_key = key[:6] + "..." + key[-4:]
         resp = JSONResponse(
-            {"ok": True, "masked": key[:6] + "..." + key[-4:], "model_label": model_label}
+            {"ok": True, "masked_key": masked_key, "masked": masked_key, "model_label": model_label}
         )
         resp.set_cookie("uid", uid, max_age=86400 * 365, httponly=True, samesite="lax")
         return resp
 
-    @rt("/api/key", methods=["GET"])
-    def get_api_key(request):
+    @rt("/api/user/config", methods=["GET"])
+    def get_user_config(request):
         uid = request.cookies.get("uid", "")
         if uid and uid in user_api_keys:
             k = user_api_keys[uid]
@@ -72,6 +99,7 @@ def register_routes(rt):
             return JSONResponse(
                 {
                     "has_key": True,
+                    "masked_key": k[:6] + "..." + k[-4:],
                     "masked": k[:6] + "..." + k[-4:],
                     "provider": prov,
                     "model": model,
@@ -80,8 +108,8 @@ def register_routes(rt):
             )
         return JSONResponse({"has_key": False})
 
-    @rt("/api/key", methods=["DELETE"])
-    def delete_api_key(request):
+    @rt("/api/user/config", methods=["DELETE"])
+    def delete_user_config(request):
         uid = request.cookies.get("uid", "")
         if uid:
             user_api_keys.pop(uid, None)

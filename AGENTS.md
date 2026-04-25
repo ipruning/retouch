@@ -10,12 +10,12 @@ No tests or linter configured. Deploy via systemd (`retouch.service`).
 
 ## Architecture
 
-Single-file FastHTML + MonsterUI app (`main.py`, ~1 360 lines). All HTML, CSS, JS, and API routes live in one file.
+FastHTML + MonsterUI app split into focused modules. `main.py` is a compatibility entrypoint; `app.py` creates the app and registers route modules.
 
 - **Providers**: Google GenAI (native streaming) and Apiyi (OpenAI-compatible, non-streaming).
-- **State**: In-memory dicts (`api_keys`, `clients`, `sessions`, `batches`) keyed by cookie `uid` / session `sid`. No database.
-- **Routes**: `/` single-image chat, `/batch` multi-image processing, `/api/key` CRUD, `/generate` SSE streaming.
-- **Generated files**: saved to `generated/` dir, served at `/generated/`.
+- **State**: In-memory dicts (`user_api_keys`, `google_clients`, `apiyi_clients`, `user_providers`, `user_models`, `sessions`, `batches`) keyed by cookie `uid` / session `sid`. No database.
+- **Routes**: pages at `/` and `/batch`; API under `/api/*`; generated files under `/files/{fname}`.
+- **Generated files**: saved to `generated/` dir, served at `/files/{fname}`.
 - **Batch processing**: `ThreadPoolExecutor` (`batch_pool`); items tracked in `batches` dict; download as ZIP.
 
 ## Code Style

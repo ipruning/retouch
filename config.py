@@ -141,13 +141,13 @@ function onProviderChange(sel){
 }
 async function checkKey(){
   try{
-    const r=await fetch('/api/key');const d=await r.json();
+    const r=await fetch('/api/user/config');const d=await r.json();
     const st=document.getElementById('key-status');
     if(d.has_key){
       hasKey=true;
       curProvider=d.provider||'google';
       curModel=d.model||'';
-      const label=(d.provider==='apiyi'?'Apiyi':'Google')+' '+d.masked;
+      const label=(d.provider==='apiyi'?'Apiyi':'Google')+' '+(d.masked_key||d.masked);
       st.textContent=label; st.className='text-xs text-green-600 mr-1';
       // Update model indicator
       const mi=document.getElementById('model-indicator');
@@ -168,13 +168,13 @@ async function saveKey(){
   msg.textContent='\u9a8c\u8bc1\u4e2d\u2026';msg.className='text-xs text-muted-foreground mt-2';
   document.getElementById('key-save-btn').disabled=true;
   try{
-    const r=await fetch('/api/key',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({key:k,provider:provider,model:model})});
+    const r=await fetch('/api/user/config',{method:'PUT',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({api_key:k,provider:provider,model:model})});
     const d=await r.json();
     if(d.ok){
       hasKey=true; curProvider=provider; curModel=model;
       msg.textContent='\u2705 \u5df2\u4fdd\u5b58';msg.className='text-xs text-green-600 mt-2';
-      const label=(provider==='apiyi'?'Apiyi':'Google')+' '+d.masked;
+      const label=(provider==='apiyi'?'Apiyi':'Google')+' '+(d.masked_key||d.masked);
       document.getElementById('key-status').textContent=label;
       document.getElementById('key-status').className='text-xs text-green-600 mr-1';
       const mi=document.getElementById('model-indicator');
@@ -188,7 +188,7 @@ async function saveKey(){
   document.getElementById('key-save-btn').disabled=false;
 }
 async function clearKey(){
-  await fetch('/api/key',{method:'DELETE'});
+  await fetch('/api/user/config',{method:'DELETE'});
   hasKey=false; curProvider='google'; curModel='';
   document.getElementById('key-status').textContent='\u672a\u8bbe\u7f6e';
   document.getElementById('key-status').className='text-xs text-muted-foreground mr-1';
@@ -282,7 +282,7 @@ async function go(){
   ra.innerHTML='<div class="result" id="cur-result"><span class="cursor-blink"></span></div>';
   scrollM();
   try{
-    const r=await fetch('/generate',{method:'POST',body:fd});
+    const r=await fetch('/api/generate/stream',{method:'POST',body:fd});
     const reader=r.body.getReader();
     const decoder=new TextDecoder();
     let buf='';
@@ -407,7 +407,7 @@ async function startBatch(){
   fd.append('prompt',prompt);
   bFiles.forEach(function(bf){fd.append('images',bf.file);});
   try{
-    const r=await fetch('/batch/start',{method:'POST',body:fd});
+    const r=await fetch('/api/batches',{method:'POST',body:fd});
     const j=await r.json();
     if(j.error){alert(j.error);btn.disabled=false;btn.classList.remove('btn-loading');btn.textContent='开始处理';return;}
     batchId=j.batch_id;
@@ -432,7 +432,7 @@ function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} }
 async function pollStatus(){
   if(!batchId)return;
   try{
-    const r=await fetch('/batch/status/'+batchId);
+    const r=await fetch('/api/batches/'+batchId);
     const j=await r.json();
     bItems=j.items;
     let done=0,failed=0,running=0,cost=0;
@@ -512,7 +512,7 @@ async function retrySelected(){
   const btn=document.getElementById('b-retry-btn');
   btn.disabled=true; btn.textContent='重试中…';
   try{
-    await fetch('/batch/retry/'+batchId+'/'+it.id,{method:'POST'});
+    await fetch('/api/batches/'+batchId+'/items/'+it.id+'/retry',{method:'POST'});
     if(!pollTimer) startPoll();
   }catch(e){alert('重试失败：'+e.message);}
   finally{ btn.disabled=false; btn.textContent='重试'; }
@@ -521,7 +521,7 @@ async function retrySelected(){
 /* ── download ── */
 function downloadZip(){
   if(!batchId)return;
-  window.location.href='/batch/download/'+batchId;
+  window.location.href='/api/batches/'+batchId+'/archive';
 }
 """
 

@@ -5,7 +5,7 @@ import traceback
 import httpx
 from starlette.responses import StreamingResponse
 
-from files import save_image, generated_response
+from files import save_image, file_response
 from providers import apiyi as apiyi_provider
 from providers import google as google_provider
 from state import (
@@ -241,10 +241,10 @@ def register_routes(rt):
     def get():
         return single_page()
 
-    @rt("/generate", methods=["POST"])
+    @rt("/api/generate/stream", methods=["POST"])
     async def generate(request):
         return await post_generate(request)
 
-    @rt("/generated/{fname}")
+    @rt("/files/{fname}")
     def get_generated(fname: str):
-        return generated_response(fname)
+        return file_response(fname)
