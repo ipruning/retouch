@@ -1,9 +1,12 @@
 import base64
+import re
+
 import httpx
-from openai import OpenAI
 
 
 def create_client(key: str, timeout=300.0):
+    from openai import OpenAI
+
     return OpenAI(
         api_key=key,
         base_url="https://api.apiyi.com/v1",
@@ -13,12 +16,10 @@ def create_client(key: str, timeout=300.0):
 
 
 def validate_key(key: str):
-    c = OpenAI(
-        api_key=key,
-        base_url="https://api.apiyi.com/v1",
-        timeout=httpx.Timeout(15.0, connect=10.0),
-    )
+    c = create_client(key, timeout=15.0)
     c.models.list()
+    return c
+
 
 def parse_image_response(content: str):
     """Parse OpenAI-compatible response that contains markdown image(s).

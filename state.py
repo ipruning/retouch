@@ -1,23 +1,31 @@
 from config import DEFAULT_MODEL
 
-api_keys: dict = {}  # uid -> key
-clients: dict = {}  # uid -> google genai Client
-oai_clients: dict = {}  # uid -> OpenAI Client
-providers: dict = {}  # uid -> "google" | "apiyi"
+user_api_keys: dict = {}  # uid -> provider API key
+google_clients: dict = {}  # uid -> google genai Client
+apiyi_clients: dict = {}  # uid -> OpenAI-compatible Apiyi Client
+user_providers: dict = {}  # uid -> "google" | "apiyi"
 user_models: dict = {}  # uid -> selected model name
-sessions: dict = {}  # sid -> google chat session or apiyi history
+sessions: dict = {}  # "{uid}_{sid}" -> Google chat, or "{uid}_oai_{sid}" -> Apiyi history
+
+
+def google_session_key(uid: str, sid: str) -> str:
+    return f"{uid}_{sid}"
+
+
+def apiyi_history_key(uid: str, sid: str) -> str:
+    return f"{uid}_oai_{sid}"
 
 
 def get_client(uid: str):
-    return clients.get(uid)
+    return google_clients.get(uid)
 
 
 def get_oai_client(uid: str):
-    return oai_clients.get(uid)
+    return apiyi_clients.get(uid)
 
 
 def get_provider(uid: str) -> str:
-    return providers.get(uid, "google")
+    return user_providers.get(uid, "google")
 
 
 def get_user_model(uid: str) -> str:
@@ -25,7 +33,7 @@ def get_user_model(uid: str) -> str:
 
 
 def has_any_client(uid: str) -> bool:
-    return uid in clients or uid in oai_clients
+    return uid in google_clients or uid in apiyi_clients
 
 
 def clear_sessions_for_user(uid: str):
@@ -35,9 +43,9 @@ def clear_sessions_for_user(uid: str):
 
 
 def clear_user(uid: str):
-    api_keys.pop(uid, None)
-    clients.pop(uid, None)
-    oai_clients.pop(uid, None)
-    providers.pop(uid, None)
+    user_api_keys.pop(uid, None)
+    google_clients.pop(uid, None)
+    apiyi_clients.pop(uid, None)
+    user_providers.pop(uid, None)
     user_models.pop(uid, None)
     clear_sessions_for_user(uid)

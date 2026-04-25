@@ -12,13 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 from fasthtml.common import JSONResponse, Response
 from starlette.responses import StreamingResponse
-from openai import OpenAI
 
 from config import GEN_DIR, USER_SEM_LIMIT, GLOBAL_SEM_LIMIT, BATCH_MAX_IMAGES, USER_MAX_BATCHES, BATCH_TTL
 from files import save_image
 from providers import apiyi as apiyi_provider
 from providers import google as google_provider
-from state import api_keys, get_client, get_provider, get_user_model, has_any_client
+from state import user_api_keys, get_client, get_provider, get_user_model, has_any_client
 from ui.batch import batch_page
 
 log = logging.getLogger("retouch")
@@ -95,14 +94,9 @@ def process_batch_item(batch_id: str, item_id: str):
 
         if prov == "apiyi":
             # OpenAI-compatible path — create fresh client per thread for thread safety
-            key = api_keys.get(uid, "")
+            key = user_api_keys.get(uid, "")
             model = get_user_model(uid)
-            oai = OpenAI(
-                api_key=key,
-                base_url="https://api.apiyi.com/v1",
-                timeout=httpx.Timeout(300.0, connect=30.0),
-                max_retries=0,
-            )
+            oai = apiyi_provider.create_client(key)
             b64 = base64.b64encode(img_bytes).decode()
             mime = item["src_mime"] or "image/png"
             log.info(
@@ -147,10 +141,8 @@ def process_batch_item(batch_id: str, item_id: str):
                         result_url = pdata
                 elif ptype == "text":
                     result_text += pdata
+            # Proxy usage pricing is opaque, so cost remains unavailable here.
             cost = 0.0
-            if r.usage:
-                # Rough cost estimate for proxy (no detailed breakdown)
-                cost = 0.0  # proxy cost is opaque
         else:
             # Google official path
             client = get_client(uid)
@@ -180,17 +172,7 @@ def process_batch_item(batch_id: str, item_id: str):
             cost = 0.0
             um = getattr(response, "usage_metadata", None)
             if um:
-                inp_t = um.prompt_token_count or 0
-                out_t = um.candidates_token_count or 0
-                think_t = um.thoughts_token_count or 0
-                img_t = 0
-                for d in um.candidates_tokens_details or []:
-                    if d.modality and d.modality.value == "IMAGE":
-                        img_t = d.token_count or 0
-                txt_out_t = out_t - img_t
-                cost = (
-                    inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0
-                ) / 1_000_000
+                cost = google_provider.usage_cost(um)
 
         item["result_url"] = result_url
         item["result_text"] = result_text

@@ -8,14 +8,24 @@ from starlette.responses import StreamingResponse
 from files import save_image, generated_response
 from providers import apiyi as apiyi_provider
 from providers import google as google_provider
-from state import sessions, get_client, get_oai_client, get_provider, get_user_model, has_any_client
+from state import (
+    sessions,
+    get_client,
+    get_oai_client,
+    get_provider,
+    get_user_model,
+    has_any_client,
+    google_session_key,
+    apiyi_history_key,
+)
 from ui.single import single_page
 
 
-def build_context(sid: str) -> dict:
-    if sid not in sessions:
+def build_context(uid: str, sid: str) -> dict:
+    session_key = google_session_key(uid, sid)
+    if session_key not in sessions:
         return {"turns": [], "total_bytes": 0}
-    chat = sessions[sid]
+    chat = sessions[session_key]
     history = chat.get_history(curated=True)
     turns = []
     total_bytes = 0
@@ -43,9 +53,10 @@ def get_or_create_chat(sid: str, uid: str):
     if not client:
         return None
     model = get_user_model(uid)
-    if sid not in sessions:
-        sessions[sid] = google_provider.create_chat(client, model)
-    return sessions[sid]
+    session_key = google_session_key(uid, sid)
+    if session_key not in sessions:
+        sessions[session_key] = google_provider.create_chat(client, model)
+    return sessions[session_key]
 
 
 def sse_event(etype: str, data: str) -> str:
@@ -105,7 +116,7 @@ async def post_generate(request):
                 content_parts.append({"type": "text", "text": prompt})
 
                 # Build conversation history for apiyi (no native chat session)
-                history_key = f"oai_{sid}"
+                history_key = apiyi_history_key(uid, sid)
                 if history_key not in sessions:
                     sessions[history_key] = []  # list of messages
                 messages = list(sessions[history_key])  # copy
@@ -203,14 +214,7 @@ async def post_generate(request):
                     inp_t = um.prompt_token_count or 0
                     out_t = um.candidates_token_count or 0
                     think_t = um.thoughts_token_count or 0
-                    img_t = 0
-                    for d in um.candidates_tokens_details or []:
-                        if d.modality and d.modality.value == "IMAGE":
-                            img_t = d.token_count or 0
-                    txt_out_t = out_t - img_t
-                    cost = (
-                        inp_t * 0.50 + (txt_out_t + think_t) * 3.0 + img_t * 60.0
-                    ) / 1_000_000
+                    cost = google_provider.usage_cost(um)
                     parts = [
                         f"<span>\u8f93\u5165 {inp_t}</span>",
                         f"<span>\u8f93\u51fa {out_t}</span>",
@@ -222,7 +226,7 @@ async def post_generate(request):
                     )
                     parts.append(f"<span>${cost:.4f}</span>")
                     yield sse_event("meta", "".join(parts))
-                ctx = build_context(sid)
+                ctx = build_context(uid, sid)
                 yield sse_event("context", json.dumps(ctx, ensure_ascii=False))
                 yield "data: [DONE]\n\n"
             except Exception as e:
@@ -244,4 +248,3 @@ def register_routes(rt):
     @rt("/generated/{fname}")
     def get_generated(fname: str):
         return generated_response(fname)
-

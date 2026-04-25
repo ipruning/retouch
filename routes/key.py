@@ -1,18 +1,15 @@
 import uuid
-import httpx
 from fasthtml.common import JSONResponse
-from openai import OpenAI
 
 from config import DEFAULT_MODEL, PROVIDERS
 from providers import apiyi as apiyi_provider
 from providers import google as google_provider
 from state import (
-    api_keys,
-    clients,
-    oai_clients,
-    providers,
+    user_api_keys,
+    google_clients,
+    apiyi_clients,
+    user_providers,
     user_models,
-    sessions,
     get_provider,
     get_user_model,
     clear_sessions_for_user,
@@ -45,23 +42,18 @@ def register_routes(rt):
                 apiyi_provider.validate_key(key)
             except Exception as e:
                 return JSONResponse({"ok": False, "error": f"Key 无效: {e}"})
-            oai_clients[uid] = OpenAI(
-                api_key=key,
-                base_url="https://api.apiyi.com/v1",
-                timeout=httpx.Timeout(300.0, connect=30.0),
-                max_retries=0,
-            )
-            clients.pop(uid, None)
+            apiyi_clients[uid] = apiyi_provider.create_client(key)
+            google_clients.pop(uid, None)
         else:
             try:
                 c = google_provider.validate_key(key, model)
             except Exception as e:
                 return JSONResponse({"ok": False, "error": f"Key 无效: {e}"})
-            clients[uid] = c
-            oai_clients.pop(uid, None)
+            google_clients[uid] = c
+            apiyi_clients.pop(uid, None)
 
-        api_keys[uid] = key
-        providers[uid] = provider
+        user_api_keys[uid] = key
+        user_providers[uid] = provider
         user_models[uid] = model
         clear_sessions_for_user(uid)
         resp = JSONResponse(
@@ -73,8 +65,8 @@ def register_routes(rt):
     @rt("/api/key", methods=["GET"])
     def get_api_key(request):
         uid = request.cookies.get("uid", "")
-        if uid and uid in api_keys:
-            k = api_keys[uid]
+        if uid and uid in user_api_keys:
+            k = user_api_keys[uid]
             prov = get_provider(uid)
             model = get_user_model(uid)
             return JSONResponse(
@@ -92,10 +84,10 @@ def register_routes(rt):
     def delete_api_key(request):
         uid = request.cookies.get("uid", "")
         if uid:
-            api_keys.pop(uid, None)
-            clients.pop(uid, None)
-            oai_clients.pop(uid, None)
-            providers.pop(uid, None)
+            user_api_keys.pop(uid, None)
+            google_clients.pop(uid, None)
+            apiyi_clients.pop(uid, None)
+            user_providers.pop(uid, None)
             user_models.pop(uid, None)
             clear_sessions_for_user(uid)
         return JSONResponse({"ok": True})
