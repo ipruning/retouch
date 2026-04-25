@@ -117,10 +117,18 @@ def parse_oai_image_response(content: str):
         parts.append(("text", text_after))
     return parts
 
+def _detect_image_ext(data: bytes) -> str:
+    """Detect image format from magic bytes."""
+    if data[:4] == b'\x89PNG':
+        return 'png'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    return 'jpg'  # default to JPEG
 
 def save_image(data: bytes) -> str:
     h = hashlib.md5(data).hexdigest()
-    fname = f"{h}.jpg"
+    ext = _detect_image_ext(data)
+    fname = f"{h}.{ext}"
     fpath = os.path.join(GEN_DIR, fname)
     if not os.path.exists(fpath):
         with open(fpath, "wb") as f:
@@ -951,11 +959,24 @@ async def post_generate(request):
         return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
 
+def _detect_mime(fpath: str) -> str:
+    """Detect image MIME type from file magic bytes."""
+    try:
+        with open(fpath, 'rb') as f:
+            hdr = f.read(12)
+        if hdr[:4] == b'\x89PNG':
+            return 'image/png'
+        if hdr[:4] == b'RIFF' and hdr[8:12] == b'WEBP':
+            return 'image/webp'
+    except Exception:
+        pass
+    return 'image/jpeg'
+
 @rt("/generated/{fname}")
 def get_generated(fname: str):
     fpath = os.path.join(GEN_DIR, fname)
     if os.path.exists(fpath):
-        return FileResponse(fpath, media_type="image/png")
+        return FileResponse(fpath, media_type=_detect_mime(fpath))
     return Response("Not found", status_code=404)
 
 
